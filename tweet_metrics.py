@@ -28,6 +28,7 @@ class TweetMetrics:
         self.headers = {
             "apikey": "2e78k9hg7j2me2g1vhky7a5bh5r0r1"
         }
+        self.metrics_cache = {}
 
     def extract_tweet_id(self, url: str) -> Optional[str]:
         """从推文URL中提取ID"""
@@ -41,12 +42,13 @@ class TweetMetrics:
         except Exception:
             return None
 
-    def get_tweet_metrics(self, tweet_url: str) -> Optional[Dict]:
+    def get_tweet_metrics(self, tweet_url: str, time_point: str = None) -> Optional[Dict]:
         """
         获取推文的互动数据
         
         Args:
             tweet_url: 推文URL
+            time_point: 时间点标识（'initial', '3min' 或 '10min'）
             
         Returns:
             包含互动数据的字典，如果失败则返回None
@@ -77,12 +79,18 @@ class TweetMetrics:
                 if "tweets" in json_data and json_data["tweets"]:
                     tweet_data = json_data["tweets"][0]
                     metrics = {
-                        "favorite_count": tweet_data.get("favorite_count", 0),
-                        "retweet_count": tweet_data.get("retweet_count", 0),
-                        "reply_count": tweet_data.get("reply_count", 0),
-                        "quote_count": tweet_data.get("quote_count", 0)
+                        "likes": tweet_data.get("favorite_count", 0),
+                        "retweets": tweet_data.get("retweet_count", 0),
+                        "replies": tweet_data.get("reply_count", 0),
+                        "quotes": tweet_data.get("quote_count", 0)
                     }
                     logger.info(f"成功获取推文数据: {metrics}")
+
+                    # 缓存数据
+                    if time_point:
+                        cache_key = f"{tweet_id}_{time_point}"
+                        self.metrics_cache[cache_key] = metrics
+
                     return metrics
                 else:
                     logger.error("API响应中没有tweets数据")
@@ -90,16 +98,31 @@ class TweetMetrics:
             else:
                 logger.error(f"API请求失败: {response.status_code} - {response.text}")
                 return None
-                        
+                    
         except Exception as e:
-            logger.error(f"获取推文数据时出错: {str(e)}")
+            logger.error(f"获取推文数据时发生错误: {str(e)}")
+            logger.error("详细错误信息:", exc_info=True)
             return None
 
 def process_excel_file():
     try:
-        # 读取Excel文件
+        # 检查文件是否存在
         file_path = "processed_data0303.xlsx"
-        df = pd.read_excel(file_path)
+        if not os.path.exists(file_path):
+            logger.error(f"文件不存在: {file_path}")
+            return
+
+        try:
+            # 读取Excel文件
+            df = pd.read_excel(file_path)
+        except Exception as e:
+            logger.error(f"读取Excel文件失败: {str(e)}")
+            return
+        
+        # 创建results目录（如果不存在）
+        if not os.path.exists(RESULTS_DIR):
+            os.makedirs(RESULTS_DIR)
+            logger.info(f"创建目录: {RESULTS_DIR}")
         
         # 打印列名
         logger.info("Excel文件的列名:")
@@ -143,15 +166,18 @@ def process_excel_file():
                     metrics = tweet_metrics.get_tweet_metrics(row[link_col])
                     if metrics:
                         # 更新数据
-                        df.at[index, 'favorite_count'] = metrics['favorite_count']
-                        df.at[index, 'retweet_count'] = metrics['retweet_count']
-                        df.at[index, 'reply_count'] = metrics['reply_count']
-                        df.at[index, 'quote_count'] = metrics['quote_count']
+                        df.at[index, 'favorite_count'] = metrics['likes']
+                        df.at[index, 'retweet_count'] = metrics['retweets']
+                        df.at[index, 'reply_count'] = metrics['replies']
+                        df.at[index, 'quote_count'] = metrics['quotes']
                         
-                        # 每次成功获取数据后保存文件
-                        latest_file = os.path.join(RESULTS_DIR, "twitter_metrics_latest.xlsx")
-                        df.to_excel(latest_file, index=False)
-                        logger.info(f"已保存最新数据到: {latest_file}")
+                        try:
+                            # 每次成功获取数据后保存文件
+                            latest_file = os.path.join(RESULTS_DIR, "twitter_metrics_latest.xlsx")
+                            df.to_excel(latest_file, index=False)
+                            logger.info(f"已保存最新数据到: {latest_file}")
+                        except Exception as e:
+                            logger.error(f"保存Excel文件失败: {str(e)}")
                         
                         retry_count = 0  # 重置重试计数
                         break
@@ -168,10 +194,13 @@ def process_excel_file():
                 time.sleep(2)
         
         # 程序完成时保存一个带时间戳的副本
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = os.path.join(RESULTS_DIR, f"twitter_metrics_{timestamp}.xlsx")
-        df.to_excel(output_file, index=False)
-        logger.info(f"所有数据处理完成，已保存到: {output_file}")
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = os.path.join(RESULTS_DIR, f"twitter_metrics_{timestamp}.xlsx")
+            df.to_excel(output_file, index=False)
+            logger.info(f"所有数据处理完成，已保存到: {output_file}")
+        except Exception as e:
+            logger.error(f"保存最终Excel文件失败: {str(e)}")
         
     except Exception as e:
         logger.error(f"处理Excel文件时出错: {str(e)}")

@@ -5,6 +5,8 @@ import time
 import os
 from datetime import datetime
 import requests
+from typing import List, Dict, Optional, Tuple
+import pandas as pd
 
 class SiliconFlowClient:
     def __init__(self, api_key):
@@ -126,7 +128,52 @@ class MessageAnalyzer:
             "三木的交易日记": {"context_messages": 5},
             "三马合约": {"context_messages": 5},
             "三马现货": {"context_messages": 5},
-            "交易员张张子": {"context_messages": 5},
+            "交易员张张子": """
+请根据以下博主的交易分析内容，提取并整理出以下信息：
+
+1. **交易币种**：提取博主提到的币种名称，一般会提到大饼=BTC=$btc，以太=ETH=$eth,SOL,BNB,DOGE。
+
+2. **方向**：提取博主的交易方向（例如：多单、空单）。
+
+3. **杠杆**：如果博主提到杠杆，请标明杠杆倍数。
+
+4. **入场点位**：如果博主提到入场价格，请列出。
+   - 入场点位1：第一个入场价格
+   - 入场点位2：第二个入场价格（如果有）
+   - 入场点位3：第三个入场价格（如果有）
+
+5. **止损点位**：如果博主提到止损价格，请列出。
+   - 止损点位1：第一个止损价格
+   - 止损点位2：第二个止损价格（如果有）
+   - 止损点位3：第三个止损价格（如果有）
+
+6. **止盈点位**：如果博主提到止盈价格，请列出。
+   - 止盈点位1：第一个止盈价格
+   - 止盈点位2：第二个止盈价格（如果有）
+   - 止盈点位3：第三个止盈价格（如果有）
+
+7. **分析内容**：提取并总结博主针对该币种的市场分析和走势预测。
+
+内容如下：
+{content}
+
+请以JSON格式返回分析结果，格式如下：
+{{
+    "交易币种": "币种名称",
+    "方向": "交易方向",
+    "杠杆": 杠杆倍数或null,
+    "入场点位1": 数字或null,
+    "入场点位2": 数字或null,
+    "入场点位3": 数字或null,
+    "止损点位1": 数字或null,
+    "止损点位2": 数字或null,
+    "止损点位3": 数字或null,
+    "止盈点位1": 数字或null,
+    "止盈点位2": 数字或null,
+    "止盈点位3": 数字或null,
+    "分析内容": "分析文字"
+}}
+""",
             "刘教练": {"context_messages": 5},
             "加密大漂亮": {"context_messages": 5},
             "大漂亮会员策略": {"context_messages": 5},
@@ -137,6 +184,15 @@ class MessageAnalyzer:
             "舒琴分析": {"context_messages": 3},
             "舒琴实盘": {"context_messages": 5},
             "颜驰": {"context_messages": 5}
+        }
+        
+        # 添加消息筛选规则
+        self.default_filter = {
+            "min_length": 10,
+            "price_indicators": ['$', '美元', 'k', 'K', '千', '万'],
+            "trading_keywords": ['多', '空', '做多', '做空', '买入', '卖出', '止损', '止盈'],
+            "required_keywords": [],
+            "excluded_keywords": []
         }
 
     def get_channel_name(self, file_path):
@@ -192,39 +248,94 @@ class MessageAnalyzer:
                     print(f"达到最大重试次数，请求失败: {str(e)}")
                     raise
 
-    def analyze_content(self, channel_name, messages):
-        """使用两步分析处理内容"""
-        if channel_name not in self.channel_prompts:
-            return None
+    def should_analyze_message(self, content: str) -> bool:
+        """判断消息是否需要分析"""
+        if not content or len(content.strip()) < self.default_filter["min_length"]:
+            return False
             
-        message_texts = [f"消息 {i+1}: {msg['content']}" for i, msg in enumerate(messages)]
-        content_to_analyze = "\n".join(message_texts)
+        # 检查是否包含价格相关信息
+        has_price = any(indicator in content for indicator in self.default_filter["price_indicators"])
         
+        # 检查是否包含交易相关词汇
+        has_trading_terms = any(keyword in content.lower() for keyword in self.default_filter["trading_keywords"])
+        
+        return has_price or has_trading_terms
+
+    def analyze_content(self, channel_name: str, messages: List[Dict]) -> Optional[str]:
+        """分析消息内容"""
         try:
-            # 第一步：使用重试机制获取初步分析结果
-            first_messages = [{"role": "user", "content": self.analysis_prompt.format(content=content_to_analyze)}]
-            first_response = self.analyze_content_with_retry(first_messages, self.analysis_prompt)
+            # 获取最新的消息
+            latest_message = messages[-1]
+            content = latest_message.get('content', '')
             
-            if first_response and 'choices' in first_response:
-                analysis_result = first_response['choices'][0]['message']['content']
-                print("\n初步分析完成，正在转换为JSON格式...")
+            # 判断是否需要分析
+            if not self.should_analyze_message(content):
+                return None
                 
-                # 第二步：使用重试机制将分析结果转换为JSON格式
-                second_messages = [{"role": "user", "content": self.json_prompt.format(content=analysis_result)}]
-                second_response = self.analyze_content_with_retry(second_messages, self.json_prompt)
+            # 获取对应的提示词
+            prompt = self.channel_prompts.get(channel_name, self.analysis_prompt)
+            
+            # 构建API请求
+            messages = [{"role": "user", "content": prompt.format(content=content)}]
+            
+            # 调用API进行分析
+            response = self.client.chat_completion(
+                messages=messages,
+                model="deepseek-ai/DeepSeek-V3",
+                max_tokens=1024,
+                temperature=0.7,
+                timeout=self.timeout
+            )
+            
+            if response and 'choices' in response:
+                result = response['choices'][0]['message']['content']
                 
-                if second_response and 'choices' in second_response:
-                    content = second_response['choices'][0]['message']['content']
-                    content = content.strip()
-                    if content.find('[') >= 0 and content.rfind(']') >= 0:
-                        content = content[content.find('['):content.rfind(']')+1]
-                    return content
-                    
+                # 保存分析结果
+                self.save_analysis_result(channel_name, {
+                    'timestamp': latest_message.get('timestamp'),
+                    'content': content,
+                    'analysis': result
+                })
+                
+                return result
+                
+        except Exception as e:
+            print(f"分析内容时出错: {str(e)}")
             return None
+
+    def save_analysis_result(self, channel_name: str, result: Dict):
+        """保存分析结果"""
+        try:
+            # 使用绝对路径
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            output_dir = os.path.join(current_dir, "analysis_results")
+            
+            # 创建输出目录
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
+            # 生成文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{output_dir}/{channel_name}_{timestamp}.json"
+            
+            # 保存JSON结果
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+                
+            # 更新Excel汇总文件
+            excel_file = os.path.join(output_dir, f"{channel_name}_analysis.xlsx")
+            df = pd.DataFrame([result])
+            
+            if os.path.exists(excel_file):
+                existing_df = pd.read_excel(excel_file)
+                df = pd.concat([existing_df, df], ignore_index=True)
+                
+            df.to_excel(excel_file, index=False)
+            
+            print(f"分析结果已保存到: {filename}")
             
         except Exception as e:
-            print(f"AI分析出错: {str(e)}")
-            return None
+            print(f"保存分析结果失败: {str(e)}")
 
 class MessageFileHandler(FileSystemEventHandler):
     def __init__(self, api_key):
@@ -259,14 +370,12 @@ class MessageFileHandler(FileSystemEventHandler):
             config = self.analyzer.channel_prompts[channel_name]
             messages = self.analyzer.get_message_history(data, config['context_messages'])
             
-            # 使用AI分析内容
+            # 使用新的分析逻辑
             analysis = self.analyzer.analyze_content(channel_name, messages)
             if analysis:
-                # 保存分析结果
-                self.save_analysis(channel_name, analysis)
                 print(f"频道 {channel_name} 的分析已完成")
-                
-            # 标记文件为已处理 
+            
+            # 标记文件为已处理
             self.processed_files.add(file_path)
             
         except json.JSONDecodeError:
@@ -321,8 +430,8 @@ def test_analyzer():
     api_key = "sk-otojtetvwuxonxxslyscpqksgeqemplmvzlndcpbnkdaexlu"
     analyzer = MessageAnalyzer(api_key)
     
-    # 指定数据文件夹路径
-    data_dir = r"C:\Users\Admin\Desktop\discord-monitor-master0306\data\messages"
+    # 更新数据文件夹路径
+    data_dir = r"C:\Users\Admin\Desktop\discord-monitor-master031\data\messages"
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_results")
     
     # 创建输出目录
@@ -387,8 +496,8 @@ def test_analyzer():
             print(f"处理文件时出错: {str(e)}")
 
 if __name__ == "__main__":
-    # 使用绝对路径
-    monitor_path = os.path.abspath(r"C:\Users\Admin\Desktop\discord-monitor-master0306\data\messages")
+    # 修改为正确的监控路径
+    monitor_path = os.path.abspath(r"C:\Users\Admin\Desktop\discord-monitor-master031\data\messages")
     
     # 添加路径检查
     if not os.path.exists(monitor_path):
@@ -398,7 +507,7 @@ if __name__ == "__main__":
     print(f"开始监控文件夹: {monitor_path}")
     print(f"分析结果将保存在: {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'analysis_results')}")
     
-    api_key = "sk-otojtetvwuxonxxslyscpqksgeqemplmvzlndcpbnkdaexlu"
+    api_key = "sk-hlsotcqdjuyulkzsnkfzvjtgadaamrrupxskxjqjrhxdeftr"
     start_monitoring(monitor_path, api_key)
 
     test_analyzer()

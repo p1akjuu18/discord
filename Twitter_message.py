@@ -12,7 +12,7 @@ from Twitter_historyaianalysis import SiliconFlowClient
 from queue import Queue
 import threading
 from tweet_metrics import TweetMetrics  # 导入TweetMetrics类
-from feishu_bot import FeishuBot  # 添加这行导入
+from Feishu_Message_Send import FeishuBot  # 添加这行导入
 
 # 创建数据保存目录
 DATA_DIR = "data"

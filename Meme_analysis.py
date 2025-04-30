@@ -19,7 +19,7 @@ import hashlib
 import base64
 import requests
 import traceback
-from feishu_bot import FeishuBot
+from Feishu_Message_Send import FeishuBot
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 import coingecko_api 
@@ -528,33 +528,171 @@ class MemeAnalyzer:
         self.data_dir = Path('data')
         self.data_dir.mkdir(exist_ok=True)
         
-        # 设置Excel文件路径
-        self.twitter_results_path = self.data_dir / 'twitter_results.xlsx'
+        # 设置所有推特数据将保存在一个Excel文件
+        self.twitter_all_data_path = self.data_dir / 'twitter_all_data.xlsx'
         self.meme_path = self.data_dir / 'meme.xlsx'
+        
+        # 设置关键词过滤配置
+        self.keyword_filters = {
+            # 黑名单关键词 - 包含这些词的推文将被过滤掉
+            'blacklist': [
+                'airdrop', 'alert', 'bot', 'scam', 'fake',
+                '金狗信号', '聪明钱', '报警', '🔥', '🚀', '🚨'
+            ],
+    
+            # 是否区分大小写
+            'case_sensitive': False
+        }
 
     async def analyze_tweets(self, term: str, tweets: List[dict]) -> dict:
-        """使用 Deepseek API 分析推文"""
+        """使用 Deepseek API 分析推文，并保存到Excel"""
         try:
-            # 提取推文内容并清理
+            # 提取推文内容并进行高级清理
+            tweet_data = []  # 用于保存到Excel的数据
             tweet_texts = []
+            
+            logger.info(f"收集 {len(tweets)} 条关于 {term} 的推文")
+            
+            # 添加关键词过滤统计
+            total_tweets = len(tweets)
+            filtered_by_blacklist = 0
+            filtered_by_whitelist = 0
+            
             for tweet in tweets:
                 text = tweet.get('text', '').strip()
+                
+                # 提取推文的详细信息
+                tweet_id = tweet.get('tweet_id', '')
+                user = tweet.get('user', {})
+                username = user.get('screen_name', '')
+                followers = user.get('followers_count', 0)
+                verified = user.get('verified', False)
+                created_at = tweet.get('created_at', '')
+                favorite_count = tweet.get('favorite_count', 0)
+                retweet_count = tweet.get('retweet_count', 0)
+                media_urls = tweet.get('medias', [])
+                media_type = tweet.get('media_type', '')
+                
                 if text:
+                    # 关键词过滤处理
+                    # 1. 转换文本大小写（如果不区分大小写）
+                    filter_text = text if self.keyword_filters['case_sensitive'] else text.lower()
+                    
+                    # 2. 黑名单过滤
+                    blacklist_keywords = self.keyword_filters['blacklist']
+                    if not self.keyword_filters['case_sensitive']:
+                        blacklist_keywords = [k.lower() for k in blacklist_keywords]
+                        
+                    # 检查是否包含黑名单关键词
+                    contains_blacklist = any(keyword in filter_text for keyword in blacklist_keywords)
+                    if contains_blacklist:
+                        filtered_by_blacklist += 1
+                        logger.debug(f"推文被黑名单过滤: {text[:50]}...")
+                        continue
+                    
+                    # 3. 白名单过滤（如果启用）
+                    if self.keyword_filters['whitelist_mode']:
+                        whitelist_keywords = self.keyword_filters['whitelist']
+                        if not self.keyword_filters['case_sensitive']:
+                            whitelist_keywords = [k.lower() for k in whitelist_keywords]
+                        
+                        # 检查是否包含白名单关键词
+                        contains_whitelist = any(keyword in filter_text for keyword in whitelist_keywords)
+                        if not contains_whitelist:
+                            filtered_by_whitelist += 1
+                            logger.debug(f"推文未通过白名单: {text[:50]}...")
+                            continue
+                    
+                    # 基础清理
                     # 清理合约地址
-                    text = re.sub(r'[A-Za-z0-9]{32,}', '', text)
+                    text_cleaned = re.sub(r'[A-Za-z0-9]{32,}', '', text)
                     # 清理URL
-                    text = re.sub(r'https?://\S+', '', text)
+                    text_cleaned = re.sub(r'https?://\S+', '', text_cleaned)
+                    
+                    # 高级清理 - 新增处理步骤
+                    # 移除用户名提及
+                    text_cleaned = re.sub(r'@\w+', '', text_cleaned)
+                    # 移除hashtags但保留文本
+                    text_cleaned = re.sub(r'#(\w+)', r'\1', text_cleaned)
+                    # 移除表情符号和特殊字符
+                    text_cleaned = re.sub(r'[^\w\s,.!?，。！？]', '', text_cleaned)
+                    # 移除多余的标点符号
+                    text_cleaned = re.sub(r'([.,!?，。！？])\1+', r'\1', text_cleaned)
+                    
                     # 清理多余空白
-                    text = ' '.join(text.split())
-                    if text.strip():  # 确保清理后还有内容
-                        tweet_texts.append(text)
+                    text_cleaned = ' '.join(text_cleaned.split())
+                    
+                    # 保存推文详细数据
+                    tweet_data.append({
+                        'token_address': term,
+                        'tweet_id': tweet_id,
+                        'username': username,
+                        'followers': followers,
+                        'verified': verified,
+                        'created_at': created_at,
+                        'text_original': text,
+                        'text_cleaned': text_cleaned,
+                        'likes': favorite_count,
+                        'retweets': retweet_count,
+                        'media_type': media_type,
+                        'media_urls': ';'.join(media_urls) if media_urls else ''
+                    })
+                    
+                    if text_cleaned.strip():  # 确保清理后还有内容
+                        # 添加推文长度检查，过滤过短的推文
+                        if len(text_cleaned.split()) >= 3:  # 至少包含3个词
+                            tweet_texts.append(text_cleaned)
             
-            if not tweet_texts:
+            # 记录过滤统计
+            logger.info(f"推文过滤统计: 总数={total_tweets}, 保留={len(tweet_data)}, "
+                       f"被黑名单过滤={filtered_by_blacklist}, "
+                       f"未通过白名单={filtered_by_whitelist if self.keyword_filters['whitelist_mode'] else 'N/A'}")
+            
+            # 保存到Excel文件
+            self._save_tweets_to_excel(term, tweet_data)
+            
+            # 以下是DeepSeek API调用部分，现在被注释掉
+            '''
+            # 内容聚合与去重 - 更智能的去重方式
+            unique_texts = []
+            seen_contents = set()
+            
+            for text in tweet_texts:
+                # 创建内容指纹 (忽略大小写和额外空格)
+                content_fingerprint = ' '.join(text.lower().split())
+                
+                # 如果内容基本相同则跳过
+                if content_fingerprint in seen_contents:
+                    continue
+                    
+                # 检查内容相似度
+                skip = False
+                for existing in seen_contents:
+                    # 如果一个文本是另一个的子集，或相似度很高，则跳过
+                    if content_fingerprint in existing or existing in content_fingerprint:
+                        skip = True
+                        break
+                
+                if not skip:
+                    seen_contents.add(content_fingerprint)
+                    unique_texts.append(text)
+            
+            # 按长度排序，优先使用内容更丰富的推文
+            unique_texts.sort(key=len, reverse=True)
+            
+            # 限制推文数量，避免超出API限制
+            max_tweets = 15
+            processed_tweets = unique_texts[:max_tweets]
+            
+            if not processed_tweets:
                 logger.warning(f"清理后没有找到有效的推文内容用于分析")
                 return self._get_default_analysis(term, len(tweets))
             
-            # 去重
-            tweet_texts = list(set(tweet_texts))
+            # 创建增强的上下文提示
+            tweet_context = f"以下是关于加密货币 {term} 的 {len(processed_tweets)} 条热门推文:\n\n"
+            
+            for i, tweet in enumerate(processed_tweets, 1):
+                tweet_context += f"推文{i}: {tweet}\n\n"
             
             # 修改认证头格式
             headers = {
@@ -572,9 +710,9 @@ class MemeAnalyzer:
                 "messages": [
                     {
                         "role": "user",
-                        "content": f"""你是一个专业的加密货币分析师，我希望你能帮我评估这个 Meme 币的潜力，并给出详细的分析和建议，请分析以下关于加密货币的推文内容：
+                        "content": f"""你是一个专业的加密货币分析师，我希望你能帮我评估这个 Meme 币的潜力，并给出详细的分析和建议。
 
-{chr(10).join(tweet_texts)}
+{tweet_context}
 
 请从以下两个方面分别进行分析，分2点，并用中文回答，我需要的结果不超过100字，你需要分以下2点明确的返回：
 
@@ -594,106 +732,243 @@ class MemeAnalyzer:
                 "frequency_penalty": 0.5
             }
             
-            logger.info(f"发送Deepseek API请求，分析 {len(tweet_texts)} 条推文")
+            logger.info(f"发送Deepseek API请求，分析 {len(processed_tweets)} 条推文")
             
+            # 发起请求
             max_retries = 3
-            retry_delay = 10
+            retry_count = 0
+            backoff_time = 1  # 初始等待时间（秒）
             
-            for attempt in range(max_retries):
+            while retry_count < max_retries:
                 try:
                     async with aiohttp.ClientSession() as session:
                         async with session.post(
                             f"{self.base_url}/v1/chat/completions",
                             headers=headers,
                             json=data,
-                            timeout=aiohttp.ClientTimeout(total=30)
+                            timeout=60  # 增加超时时间
                         ) as response:
-                            response_text = await response.text()
-                            logger.info(f"Deepseek API响应状态码: {response.status}")
-                            logger.info(f"Deepseek API响应头: {dict(response.headers)}")
-                            logger.info(f"Deepseek API请求数据: {json.dumps(data, ensure_ascii=False)}")
-                            logger.info(f"Deepseek API响应内容: {response_text}")
-                            
                             if response.status == 200:
-                                result = json.loads(response_text)
-                                if 'choices' in result and len(result['choices']) > 0:
-                                    analysis = result['choices'][0]['message']['content']
-                                    
-                                    # 解析分析结果
-                                    narrative = ""
-                                    community_heat = ""
-                                    spread_potential = ""
-                                    investment_value = ""
-                                    
-                                    # 移除所有 Markdown 标记
-                                    analysis = analysis.replace('**', '')
-                                    
-                                    # 分割主要部分
-                                    parts = analysis.split('\n\n')
-                                    
-                                    # 解析叙事信息和可持续性评估
-                                    for part in parts:
-                                        if '1. 叙事信息' in part:
-                                            narrative = part.replace('1. 叙事信息：', '').strip()
-                                        elif '2. 可持续性' in part:
-                                            lines = part.split('\n')
-                                            for line in lines:
-                                                line = line.strip()
-                                                if '社区热度' in line:
-                                                    community_heat = line.split('：')[1].strip() if '：' in line else ''
-                                                elif '传播潜力' in line:
-                                                    spread_potential = line.split('：')[1].strip() if '：' in line else ''
-                                                elif '短期投机价值' in line:
-                                                    investment_value = line.split('：')[1].strip() if '：' in line else ''
-                                    
-                                    result_dict = {
-                                        '搜索关键词': term,
-                                        '叙事信息': narrative,
-                                        '可持续性_社区热度': community_heat,
-                                        '可持续性_传播潜力': spread_potential,
-                                        '可持续性_短期投机价值': investment_value,
-                                        '原始推文数量': len(tweets),
-                                        '分析时间': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                    }
-                                    
-                                    logger.info(f"成功完成分析: {result_dict}")
-                                    
-                                    # 更新整合器的 Twitter 分析结果
-                                    self.integrator.update_twitter_analysis(term, result_dict)
-                                    
-                                    return result_dict
-                                    
-                            elif response.status == 400:
-                                logger.error(f"Deepseek API请求参数错误: {response_text}")
-                                try:
-                                    error_data = json.loads(response_text)
-                                    logger.error(f"错误详情: {json.dumps(error_data, ensure_ascii=False, indent=2)}")
-                                except:
-                                    logger.error(f"无法解析错误响应: {response_text}")
-                                return self._get_default_analysis(term, len(tweets))
-                            elif response.status == 401:
-                                logger.error("Deepseek API认证失败，请检查API key")
-                                return self._get_default_analysis(term, len(tweets))
-                            elif response.status == 429:
-                                logger.warning("Deepseek API速率限制")
-                                return self._get_default_analysis(term, len(tweets))
-                            else:
-                                logger.error(f"Deepseek API请求失败: {response.status}")
-                                logger.error(f"错误响应: {response_text}")
-                                return self._get_default_analysis(term, len(tweets))
+                                result = await response.json()
+                                analysis_content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
                                 
+                                if not analysis_content:
+                                    logger.warning("API返回内容为空")
+                                    return self._get_default_analysis(term, len(tweets))
+                                    
+                                logger.info("成功接收到API响应")
+                                
+                                # 解析回复内容
+                                analysis_results = self._parse_analysis(analysis_content)
+                                analysis_results['搜索关键词'] = term
+                                analysis_results['原始推文数量'] = len(tweets)
+                                return analysis_results
+                            else:
+                                error_text = await response.text()
+                                logger.error(f"API请求失败，状态码: {response.status}, 错误: {error_text}")
+                                
+                                if response.status == 429:  # 速率限制
+                                    retry_count += 1
+                                    wait_time = backoff_time * (2 ** (retry_count - 1))  # 指数退避
+                                    logger.warning(f"API速率限制，等待 {wait_time} 秒后重试 ({retry_count}/{max_retries})")
+                                    await asyncio.sleep(wait_time)
+                                    continue
+                                
+                                return self._get_default_analysis(term, len(tweets))
                 except Exception as e:
-                    logger.error(f"调用Deepseek API时出错: {str(e)}")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(retry_delay)
-                        continue
+                    logger.error(f"请求API时出错: {str(e)}")
+                    retry_count += 1
                     
-            return self._get_default_analysis(term, len(tweets))
+                    if retry_count < max_retries:
+                        wait_time = backoff_time * (2 ** (retry_count - 1))
+                        logger.warning(f"网络错误，等待 {wait_time} 秒后重试 ({retry_count}/{max_retries})")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error(f"达到最大重试次数，放弃请求")
+                        return self._get_default_analysis(term, len(tweets))
+            '''
+            
+            # 返回一个简单的统计结果，不使用DeepSeek
+            return {
+                '搜索关键词': term,
+                '原始推文数量': total_tweets,
+                '过滤后推文数量': len(tweet_data),
+                '过滤掉的推文数量': total_tweets - len(tweet_data),
+                '收集时间': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
             
         except Exception as e:
-            logger.error(f"分析推文时发生错误: {str(e)}")
-            logger.exception(e)
+            logger.error(f"处理推文时出错: {str(e)}")
+            logger.error(traceback.format_exc())
             return self._get_default_analysis(term, len(tweets))
+
+    def _save_tweets_to_excel(self, term: str, tweet_data: List[dict]):
+        """保存推文数据到同一个Excel文件中"""
+        try:
+            logger.info(f"开始保存 {len(tweet_data)} 条推文数据到统一文件...")
+            
+            # 准备数据，添加时间戳
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for tweet in tweet_data:
+                tweet['保存时间'] = timestamp
+            
+            # 如果文件已存在，读取现有数据
+            if self.twitter_all_data_path.exists():
+                try:
+                    with pd.ExcelFile(self.twitter_all_data_path) as xls:
+                        # 检查文件中是否已有详细推文表
+                        if 'tweets_details' in xls.sheet_names:
+                            existing_df = pd.read_excel(xls, sheet_name='tweets_details')
+                            # 合并数据
+                            new_df = pd.concat([existing_df, pd.DataFrame(tweet_data)], ignore_index=True)
+                        else:
+                            new_df = pd.DataFrame(tweet_data)
+                        
+                        # 读取其他表格数据
+                        other_sheets = {}
+                        for sheet in xls.sheet_names:
+                            if sheet != 'tweets_details':
+                                other_sheets[sheet] = pd.read_excel(xls, sheet_name=sheet)
+                except Exception as e:
+                    logger.error(f"读取现有Excel文件时出错: {str(e)}")
+                    # 如果读取失败，创建新DataFrame
+                    new_df = pd.DataFrame(tweet_data)
+                    other_sheets = {}
+            else:
+                # 创建新DataFrame
+                new_df = pd.DataFrame(tweet_data)
+                other_sheets = {}
+            
+            # 创建ExcelWriter，准备写入多个表格
+            with pd.ExcelWriter(self.twitter_all_data_path, engine='openpyxl') as writer:
+                # 写入详细推文数据
+                new_df.to_excel(writer, sheet_name='tweets_details', index=False)
+                
+                # 写入其他表格
+                for sheet_name, df in other_sheets.items():
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                
+                # 调用方法保存统计结果到统一文件
+                self._append_to_main_results(term, tweet_data, writer)
+            
+            logger.info(f"已将 {len(tweet_data)} 条推文数据保存到文件: {self.twitter_all_data_path}")
+            
+        except Exception as e:
+            logger.error(f"保存推文数据到Excel时出错: {str(e)}")
+            logger.error(traceback.format_exc())
+
+    def _append_to_main_results(self, term: str, tweet_data: List[dict], writer=None):
+        """将统计数据添加到同一个Excel文件的不同表格中"""
+        try:
+            # 整合所有推文相关信息
+            if not tweet_data:
+                return
+                
+            # 计算一些统计数据
+            total_tweets = len(tweet_data)
+            verified_tweets = sum(1 for t in tweet_data if t.get('verified', False))
+            total_followers = sum(t.get('followers', 0) for t in tweet_data)
+            total_likes = sum(t.get('likes', 0) for t in tweet_data)
+            total_retweets = sum(t.get('retweets', 0) for t in tweet_data)
+            
+            # 提取最高影响力的推文(根据点赞+转发数)
+            sorted_tweets = sorted(tweet_data, key=lambda t: (t.get('likes', 0) + t.get('retweets', 0)), reverse=True)
+            top_tweet = sorted_tweets[0] if sorted_tweets else {}
+            
+            # 准备要添加到统计表格的数据
+            main_data = {
+                '代币地址': term,
+                '分析时间': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                '搜索关键词': term,
+                '原始推文数量': total_tweets,
+                '已验证账号推文': verified_tweets,
+                '总粉丝数': total_followers,
+                '总点赞数': total_likes,
+                '总转发数': total_retweets,
+                '最热门推文': top_tweet.get('text_cleaned', '')[:100] if top_tweet else '',
+                '最热门推文_用户': top_tweet.get('username', '') if top_tweet else '',
+                '最热门推文_点赞': top_tweet.get('likes', 0) if top_tweet else 0,
+                '最热门推文_转发': top_tweet.get('retweets', 0) if top_tweet else 0,
+                'twitter_analyzed': True,
+                'deepseek_analyzed': False
+            }
+            
+            # 定义列名
+            columns = [
+                '代币地址', '分析时间', '搜索关键词', '原始推文数量',
+                '已验证账号推文', '总粉丝数', '总点赞数', '总转发数',
+                '最热门推文', '最热门推文_用户', '最热门推文_点赞', '最热门推文_转发',
+                'twitter_analyzed', 'deepseek_analyzed'
+            ]
+            
+            # 如果有提供writer，说明是在_save_tweets_to_excel中调用的
+            if writer:
+                # 读取现有统计表格或创建新表格
+                try:
+                    # 检查是否存在统计表格
+                    with pd.ExcelFile(self.twitter_all_data_path) as xls:
+                        if 'statistics' in xls.sheet_names:
+                            main_df = pd.read_excel(xls, sheet_name='statistics')
+                        else:
+                            main_df = pd.DataFrame(columns=columns)
+                except:
+                    main_df = pd.DataFrame(columns=columns)
+                    
+                # 更新或添加记录
+                if '代币地址' in main_df.columns:
+                    existing_mask = main_df['代币地址'] == term
+                    if existing_mask.any():
+                        # 更新现有记录
+                        for key, value in main_data.items():
+                            if key in main_df.columns:
+                                main_df.loc[existing_mask, key] = value
+                    else:
+                        # 添加新记录
+                        main_df = pd.concat([main_df, pd.DataFrame([main_data])], ignore_index=True)
+                else:
+                    # 如果列不存在，创建新DataFrame
+                    main_df = pd.DataFrame([main_data])
+                    
+                # 写入统计表格
+                main_df.to_excel(writer, sheet_name='statistics', index=False)
+            else:
+                # 如果是单独调用的，需要单独写入文件
+                try:
+                    with pd.ExcelFile(self.twitter_all_data_path) as xls:
+                        # 读取所有表格
+                        sheets = {sheet: pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names}
+                        
+                        # 更新或创建统计表格
+                        if 'statistics' in sheets:
+                            main_df = sheets['statistics']
+                            # 更新或添加记录
+                            existing_mask = main_df['代币地址'] == term
+                            if existing_mask.any():
+                                for key, value in main_data.items():
+                                    if key in main_df.columns:
+                                        main_df.loc[existing_mask, key] = value
+                            else:
+                                main_df = pd.concat([main_df, pd.DataFrame([main_data])], ignore_index=True)
+                        else:
+                            main_df = pd.DataFrame([main_data], columns=columns)
+                        
+                        sheets['statistics'] = main_df
+                        
+                        # 重新写入所有表格
+                        with pd.ExcelWriter(self.twitter_all_data_path, engine='openpyxl') as writer:
+                            for sheet_name, df in sheets.items():
+                                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                except Exception as e:
+                    # 如果文件不存在或读取失败，创建新文件
+                    main_df = pd.DataFrame([main_data], columns=columns)
+                    with pd.ExcelWriter(self.twitter_all_data_path, engine='openpyxl') as writer:
+                        main_df.to_excel(writer, sheet_name='statistics', index=False)
+            
+            logger.info(f"已更新统计数据表格")
+            
+        except Exception as e:
+            logger.error(f"更新统计数据表格时出错: {str(e)}")
+            logger.error(traceback.format_exc())
 
     def _get_default_analysis(self, term: str, tweet_count: int) -> dict:
         """返回默认的分析结果"""
@@ -762,6 +1037,19 @@ class MemeAnalyzer:
         except Exception as e:
             logger.error(f"处理历史数据文件时出错: {str(e)}")
             logger.exception(e)
+
+    def update_keyword_filters(self, new_filters):
+        """更新关键词过滤配置"""
+        if not isinstance(new_filters, dict):
+            raise ValueError("过滤器必须是字典格式")
+            
+        # 更新配置
+        for key, value in new_filters.items():
+            if key in self.keyword_filters:
+                self.keyword_filters[key] = value
+                
+        logger.info(f"关键词过滤配置已更新: {self.keyword_filters}")
+        return self.keyword_filters
 
 class BacktestProcessor:
     def __init__(self):
@@ -1195,7 +1483,8 @@ class MemeAnalysisMonitor:
         except Exception as e:
             logging.error(f"处理新数据时发生错误: {str(e)}")
 
-# 新增文件监控类
+# 注释掉MemeFileWatcher类或保留但不使用
+'''
 class MemeFileWatcher(FileSystemEventHandler):
     """监控 meme.xlsx 文件的变化并处理新增数据"""
     
@@ -1461,7 +1750,7 @@ class MemeFileWatcher(FileSystemEventHandler):
                         if tweets:
                             logger.info(f"找到 {len(tweets)} 条相关推文")
                             twitter_analysis = await self.analyzer.analyze_tweets(token_address, tweets)
-                            logger.info(f"已完成 {token_address} 的 Twitter 分析")
+                            logger.info(f"已完成 Twitter 数据保存: {twitter_analysis}")
                             break
                         else:
                             logger.warning(f"未找到关于 {token_address} 的推文")
@@ -1554,6 +1843,7 @@ class MemeFileWatcher(FileSystemEventHandler):
         observer.start()
         logger.info(f"开始监控目录: {directory}")
         return observer
+'''
 
 # 修改主函数
 async def main():
@@ -1564,21 +1854,16 @@ async def main():
         parser.add_argument('--twitter', action='store_true', help='只运行 Twitter 分析')
         parser.add_argument('--start', type=int, default=0, help='CoinGecko 分析的起始索引')
         parser.add_argument('--batch', type=int, default=10, help='CoinGecko 批处理大小')
-        parser.add_argument('--watch', action='store_true', help='启用文件监控模式')
+        # 注释掉监控模式选项
+        # parser.add_argument('--watch', action='store_true', help='启用文件监控模式')
         args = parser.parse_args()
         
-        # 根据命令行参数决定运行哪些分析
-        run_twitter = not args.coingecko or args.twitter
+        # 默认运行Twitter分析
+        run_twitter = True  # 默认启用Twitter分析
         run_coingecko = not args.twitter or args.coingecko
-        watch_mode = args.watch
         
         # 配置整合器是否需要两种分析都完成
-        if run_twitter and run_coingecko:
-            # 需要两种分析都完成
-            pass
-        else:
-            # 修改整合器方法，允许只有一种分析完成就发送
-            integrator._need_both_analyses = lambda: False
+        integrator._need_both_analyses = lambda: False  # 修改为不需要两种分析都完成
         
         # 初始化分析器实例
         twitter_analyzer = None
@@ -1591,52 +1876,71 @@ async def main():
         if run_coingecko:
             logger.info("初始化 CoinGecko 代币分析器...")
             coingecko_analyzer = CoinGeckoAnalyzer()
-            
-        # 启用文件监控模式
-        if watch_mode:
-            logger.info("启动文件监控模式...")
-            meme_file_path = Path('data') / 'meme.xlsx'
-            
-            # 创建文件监控器
-            watcher = MemeFileWatcher(
-                meme_file_path=meme_file_path,
-                analyzer=twitter_analyzer,
-                coingecko_analyzer=coingecko_analyzer
-            )
-            
-            # 开始监控
-            observer = watcher.start_watching()
-            
-            # 保持主线程运行
-            try:
-                logger.info("文件监控已启动，按 Ctrl+C 停止...")
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                logger.info("收到停止信号，正在停止监控...")
-                observer.stop()
-            observer.join()
-        else:
-            # 使用传统模式，处理整个文件
-            if run_twitter and twitter_analyzer:
-                logger.info("启动 Twitter Meme 分析...")
-                await twitter_analyzer.process_history_file()
-            
-            if run_coingecko and coingecko_analyzer:
-                logger.info("启动 CoinGecko 代币分析...")
-                await coingecko_analyzer.process_meme_file(
-                    start_index=args.start, 
-                    batch_size=args.batch
-                )
-            
-            # 保持主线程运行，等待用户中断
-            logger.info("程序正在运行中，按 Ctrl+C 退出...")
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                logger.info("接收到中断信号，程序退出...")
         
+        # 直接处理meme.xlsx文件，而不是监控它
+        logger.info("开始直接处理 meme.xlsx 文件...")
+        meme_file_path = Path('data') / 'meme.xlsx'
+        
+        if not meme_file_path.exists():
+            logger.error(f"文件 {meme_file_path} 不存在!")
+            return
+            
+        # 读取meme.xlsx
+        df = pd.read_excel(meme_file_path)
+        logger.info(f"成功读取 meme.xlsx，共有 {len(df)} 条记录")
+            
+        # 处理所有代币地址
+        for index, row in df.iterrows():
+            try:
+                token_address = row['内容']
+                if pd.isna(token_address) or not token_address.strip():
+                    logger.warning(f"跳过空地址，索引 {index}")
+                    continue
+                
+                logger.info(f"处理代币 [{index+1}/{len(df)}]: {token_address}")
+                
+                # 注册到整合器
+                integrator.register_token(token_address)
+                
+                # Twitter分析
+                if run_twitter and twitter_analyzer:
+                    try:
+                        logger.info(f"开始对 {token_address} 进行 Twitter 搜索...")
+                        tweets = await twitter_api.search_tweets(token_address)
+                        
+                        if tweets:
+                            logger.info(f"找到 {len(tweets)} 条相关推文，保存数据...")
+                            analysis = await twitter_analyzer.analyze_tweets(token_address, tweets)
+                            logger.info(f"已完成 Twitter 数据保存: {analysis}")
+                        else:
+                            logger.warning(f"未找到关于 {token_address} 的推文")
+                    except Exception as e:
+                        logger.error(f"Twitter 分析失败: {str(e)}")
+                
+                # 注释掉 CoinGecko 分析部分 
+                '''
+                # CoinGecko分析
+                if run_coingecko and coingecko_analyzer:
+                    try:
+                        logger.info(f"开始对 {token_address} 进行 CoinGecko 分析...")
+                        token_data = await coingecko_analyzer.analyze_token(token_address)
+                        if token_data:
+                            logger.info(f"完成 CoinGecko 分析")
+                        else:
+                            logger.warning(f"CoinGecko 无法分析代币 {token_address}")
+                    except Exception as e:
+                        logger.error(f"CoinGecko 分析失败: {str(e)}")
+                '''
+                
+                # 添加间隔，避免API限制
+                await asyncio.sleep(2)
+                
+            except Exception as e:
+                logger.error(f"处理代币时出错: {str(e)}")
+                continue
+        
+        logger.info("所有代币处理完成")
+            
     except Exception as e:
         logger.error(f"运行时发生错误: {str(e)}")
         logger.exception(e)
@@ -1646,17 +1950,10 @@ if __name__ == '__main__':
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
-    # 检查是否有命令行参数
-    if len(sys.argv) > 1:
-        # 有命令行参数，使用异步运行
+    # 直接运行主函数，不使用监控模式
+    try:
+        logger.info("启动程序 - 直接处理模式")
         asyncio.run(main())
-    else:
-        # 没有命令行参数，默认启动文件监控模式
-        try:
-            logger.info("使用默认模式启动程序 - 启动文件监控模式")
-            # 设置命令行参数为启动监控模式
-            sys.argv.append('--watch')
-            asyncio.run(main())
-        except Exception as e:
-            logger.error(f"运行时发生错误: {str(e)}")
-            logger.exception(e)
+    except Exception as e:
+        logger.error(f"运行时发生错误: {str(e)}")
+        logger.exception(e)

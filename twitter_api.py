@@ -12,6 +12,7 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 API_URL = "https://api.apidance.pro/sapi/Search"
+API_TWEET_URL = "https://api.apidance.pro/sapi/TweetDetail"
 API_KEY = "2e78k9hg7j2me2g1vhky7a5bh5r0r1"
 
 async def search_tweets(query: str) -> List[Dict]:
@@ -77,6 +78,69 @@ async def search_tweets(query: str) -> List[Dict]:
         logger.error(f"搜索Twitter时出错: {str(e)}")
         return []
 
+async def get_tweet_by_id(tweet_id: str) -> Optional[Dict]:
+    """
+    通过推文ID获取单条推文的详细信息
+    
+    Args:
+        tweet_id: 推文ID
+        
+    Returns:
+        包含推文信息的字典，如果出错则返回None
+    """
+    try:
+        headers = {
+            "apikey": API_KEY,
+            "Content-Type": "application/json"
+        }
+        
+        params = {
+            "tweet_id": tweet_id
+        }
+        
+        timeout = aiohttp.ClientTimeout(total=30)
+        connector = aiohttp.TCPConnector(ssl=False)
+
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(
+                API_TWEET_URL,
+                params=params,
+                headers=headers,
+                timeout=timeout
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"API返回数据: {data}")
+                    
+                    if isinstance(data, dict):
+                        # 根据API返回的数据结构解析
+                        if 'tweet' in data:
+                            tweet_data = data['tweet']
+                        elif 'data' in data and 'tweet' in data['data']:
+                            tweet_data = data['data']['tweet']
+                        else:
+                            logger.error(f"无法解析API返回的推文数据: {data}")
+                            return None
+                            
+                        return {
+                            'text': tweet_data.get('text', ''),
+                            'created_at': tweet_data.get('created_at', ''),
+                            'id': tweet_data.get('tweet_id', tweet_data.get('id', '')),
+                            'author': tweet_data.get('user', {}).get('username', ''),
+                            'likes': tweet_data.get('favorite_count', 0),
+                            'retweets': tweet_data.get('retweet_count', 0),
+                            'media': tweet_data.get('media', [])
+                        }
+                    return None
+                else:
+                    error_text = await response.text()
+                    logger.error(f"获取推文API请求失败: {response.status} - {error_text}")
+                    return None
+                    
+    except Exception as e:
+        logger.error(f"获取推文时出错: {str(e)}")
+        return None
+
 async def test():
     # 测试搜索功能
     query = "eth"
@@ -90,6 +154,21 @@ async def test():
             logger.info(f"找到 {len(result)} 条推文")
         else:
             logger.error("搜索失败或未找到推文")
+    except Exception as e:
+        logger.error(f"测试时发生错误: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+    # 添加测试获取特定推文的代码
+    tweet_id = "1902608673022595531"  # 从URL中提取的推文ID
+    logger.info(f"测试获取推文ID: {tweet_id}")
+    
+    try:
+        tweet = await get_tweet_by_id(tweet_id)
+        if tweet:
+            logger.info(f"推文内容: {json.dumps(tweet, indent=2, ensure_ascii=False)}")
+        else:
+            logger.error("获取推文失败")
     except Exception as e:
         logger.error(f"测试时发生错误: {str(e)}")
         import traceback

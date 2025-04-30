@@ -8,7 +8,6 @@ import aiohttp
 from datetime import datetime, timedelta, timezone
 import os
 import socket
-from aiohttp_socks import ProxyConnector
 from pathlib import Path
 import pandas as pd
 import time
@@ -80,7 +79,6 @@ class Config:
     def __init__(self, config_file='config.json'):
         self.config_file = config_file
         self._config = self.load_config(config_file)  # 使用_config存储配置
-        self._use_proxy = True  # 添加代理开关
         # 添加飞书配置
         self.feishu_webhook = self._config.get("feishu_webhook", "")
         self.feishu_secret = self._config.get("feishu_secret", "")
@@ -91,7 +89,17 @@ class Config:
                 return json.load(f)
         except Exception as e:
             logging.error(f"加载配置文件失败: {str(e)}")
-            raise
+            # 如果加载失败，创建默认配置
+            default_config = {
+                "token": "",
+                "monitor": {
+                    "save_path": "data/messages",
+                    "channels": [],
+                    "channel_names": {},
+                    "channel_types": {}
+                }
+            }
+            return default_config
 
     # 添加获取配置的方法
     def get_save_path(self):
@@ -102,23 +110,6 @@ class Config:
 
     def get_token(self):
         return self._config['token']
-
-    def get_proxy(self):
-        """获取代理设置"""
-        if not self._use_proxy:
-            return None
-        
-        # 从配置文件获取代理设置，如果没有则使用默认值
-        proxy = self._config.get('proxy', "http://127.0.0.1:18937")
-        return proxy
-
-    def disable_proxy(self):
-        self._use_proxy = False
-        logger.info("已禁用代理")
-
-    def enable_proxy(self):
-        self._use_proxy = True
-        logger.info("已启用代理")
 
     def get_channel_name(self, channel_id):
         """获取频道名称"""
@@ -275,32 +266,14 @@ class SimpleDiscordMonitor(discord.Client):
     async def setup_http_session(self):
         """设置HTTP会话"""
         try:
-            # 从配置中获取代理
-            proxy = self.config.get_proxy() or "http://127.0.0.1:18937"
-            
-            try:
-                # 使用 ProxyConnector 设置代理
-                connector = ProxyConnector.from_url(
-                    proxy,
-                    ssl=False,
-                    force_close=True,
-                    enable_cleanup_closed=True,
-                    ttl_dns_cache=300,
-                    limit=10,
-                    family=socket.AF_INET,
-                    rdns=True
-                )
-                logger.info(f"HTTP会话使用代理: {proxy}")
-            except Exception as e:
-                logger.error(f"代理设置失败，切换到直连模式: {str(e)}")
-                connector = aiohttp.TCPConnector(
-                    ssl=False,
-                    force_close=True,
-                    enable_cleanup_closed=True,
-                    ttl_dns_cache=300,
-                    limit=10
-                )
-                logger.info("已切换到直连模式")
+            # 创建TCP连接器
+            connector = aiohttp.TCPConnector(
+                ssl=False,
+                force_close=True,
+                enable_cleanup_closed=True,
+                ttl_dns_cache=300,
+                limit=10
+            )
             
             # 设置超时
             timeout = aiohttp.ClientTimeout(
@@ -324,21 +297,29 @@ class SimpleDiscordMonitor(discord.Client):
             
         except Exception as e:
             logger.error(f"设置HTTP会话时发生错误: {str(e)}")
-            raise
+            # 在出错时创建一个基本的会话作为后备
+            try:
+                logger.info("尝试创建后备HTTP会话...")
+                backup_connector = aiohttp.TCPConnector(ssl=False, force_close=True)
+                backup_session = aiohttp.ClientSession(
+                    connector=backup_connector,
+                    headers={'User-Agent': 'Mozilla/5.0'}
+                )
+                logger.info("成功创建后备HTTP会话")
+                return backup_session
+            except Exception as backup_error:
+                logger.error(f"创建后备HTTP会话也失败: {str(backup_error)}")
+                raise
 
     def __init__(self, config):
         # 保存配置
         self.config = config
         
-        # 获取代理设置
-        proxy = config.get_proxy() or "http://127.0.0.1:18937"
-        
         # 使用 discord.py-self 的正确初始化方式
         super().__init__(
             self_bot=True,  # 必须设置为 True，表示这是一个用户账号
             chunk_guilds_at_startup=False,  # 不需要加载所有成员
-            max_messages=10000,  # 消息缓存上限
-            proxy=proxy  # 设置代理
+            max_messages=10000  # 消息缓存上限
         )
         
         # 初始化其他组件
@@ -568,34 +549,30 @@ class SimpleDiscordMonitor(discord.Client):
             logger.error(f"保存消息时出错: {str(e)}")
             logger.exception(e)
 
-    async def check_proxy(self):
-        """检查代理是否可用"""
-        try:
-            proxy = self.config.get_proxy()
-            async with aiohttp.ClientSession() as session:
-                async with session.get('http://httpbin.org/ip', proxy=proxy) as response:
-                    if response.status == 200:
-                        logger.info(f"代理可用: {proxy}")
-                        return True
-                    else:
-                        logger.error(f"代理不可用: {proxy}")
-                        return False
-        except Exception as e:
-            logger.error(f"检查代理时发生错误: {str(e)}")
-            return False
-
     async def save_meme_data(self, meme_data: List[dict]):
         """保存meme数据到Excel"""
         try:
+            # 确保使用正确的文件扩展名
             meme_path = self.data_dir / 'meme.xlsx'
+            
+            # 检查目录是否存在，不存在则创建
+            os.makedirs(self.data_dir, exist_ok=True)
+            
+            # 尝试使用openpyxl引擎
             if meme_path.exists():
-                df_meme = pd.read_excel(meme_path)
-                df_meme = pd.concat([df_meme, pd.DataFrame(meme_data)], ignore_index=True)
+                try:
+                    # 明确指定引擎为openpyxl
+                    df_meme = pd.read_excel(meme_path, engine='openpyxl')
+                    df_meme = pd.concat([df_meme, pd.DataFrame(meme_data)], ignore_index=True)
+                except Exception as excel_error:
+                    logger.error(f"读取现有Excel文件失败: {excel_error}，创建新文件")
+                    df_meme = pd.DataFrame(meme_data)
             else:
                 df_meme = pd.DataFrame(meme_data)
             
-            df_meme.to_excel(meme_path, index=False)
-            logger.info(f"成功保存 {len(meme_data)} 条meme数据到Excel")
+            # 保存时也指定引擎
+            df_meme.to_excel(str(meme_path), index=False, engine='openpyxl')
+            logger.info(f"成功保存 {len(meme_data)} 条meme数据到Excel: {str(meme_path)}")
         except Exception as e:
             logger.error(f"保存meme数据时出错: {e}")
             logger.exception(e)
@@ -603,17 +580,8 @@ class SimpleDiscordMonitor(discord.Client):
 
 def main():
     try:
-        # 清除环境变量中的代理设置
-        if 'HTTP_PROXY' in os.environ:
-            del os.environ['HTTP_PROXY']
-        if 'HTTPS_PROXY' in os.environ:
-            del os.environ['HTTPS_PROXY']
-        
         logger.info("正在启动Discord监控...")
         config = Config()  # 加载配置
-        
-        # 在这里禁用代理
-        config.disable_proxy()
         
         client = SimpleDiscordMonitor(config)
         
@@ -628,7 +596,8 @@ def main():
         signal.signal(signal.SIGTERM, signal_handler)
         
         logger.info("开始运行客户端...")
-        client.run(config.get_token())  # 使用方法获取token
+        client.run(config.get_token())
+        
     except discord.LoginFailure:
         logger.error("登录失败！请检查token是否正确")
     except Exception as e:

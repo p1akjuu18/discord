@@ -75,3 +75,31 @@ push = config.push
 push_content = config.push_content
 
 TOKEN = 'your_new_token_here'  # 替换为新的token
+
+# -*- coding: utf-8 -*-
+"""
+配置文件
+"""
+
+# 币安API配置
+BINANCE_API_KEY = 'VIJFNRp99K0dvJ7GEZFsnCVbuLhruo2H1Kh4xADeviXjegoV0NQKzFv8I2cSMcvF'
+BINANCE_API_SECRET = 'jmEqAmrFYOhfnT65YFOvxn6nhOQ7TYw9pJlGltOY0xxDCyrZDrSQdiK9z4Yygc9a'
+
+# 交易配置
+TRADING_CONFIG = {
+    'max_position_size': 0.1,  # 最大仓位比例
+    'stop_loss_percentage': 0.02,  # 止损百分比
+    'take_profit_percentage': 0.04,  # 止盈百分比
+    'max_open_orders': 5,  # 最大同时开仓数量
+}
+
+# 支持的交易对
+SUPPORTED_SYMBOLS = {
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT",
+    "CRV": "CRVUSDT",
+    "TIA": "TIAUSDT",
+    "BMT": "BMTUSDT"
+}

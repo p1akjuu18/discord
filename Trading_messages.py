@@ -132,11 +132,37 @@ class MessageFileHandler(FileSystemEventHandler):
         self.processing_lock = threading.Lock()  # 添加线程锁防止并发处理同一文件
         self.current_processing_file = None  # 当前正在处理的文件
         # 防止集合过大，限制大小
-        self.max_processed_items = 1000
+        self.max_processed_items = 10000  # 增加限制到10000
         # 添加文件过滤规则
         self.skip_files = ["1283359910788202499-土狗博主群ca.json"]
+        # 添加消息ID持久化文件路径
+        self.processed_ids_file = "data/processed_message_ids.json"
+        # 加载已处理的消息ID
+        self._load_processed_ids()
         logger.info("消息处理器已初始化")
         
+    def _load_processed_ids(self):
+        """从文件加载已处理的消息ID"""
+        try:
+            if os.path.exists(self.processed_ids_file):
+                with open(self.processed_ids_file, 'r', encoding='utf-8') as f:
+                    self.processed_message_ids = set(json.load(f))
+                logger.info(f"已加载 {len(self.processed_message_ids)} 个已处理的消息ID")
+        except Exception as e:
+            logger.error(f"加载已处理消息ID时出错: {str(e)}")
+            self.processed_message_ids = set()
+
+    def _save_processed_ids(self):
+        """保存已处理的消息ID到文件"""
+        try:
+            # 确保目录存在
+            os.makedirs(os.path.dirname(self.processed_ids_file), exist_ok=True)
+            with open(self.processed_ids_file, 'w', encoding='utf-8') as f:
+                json.dump(list(self.processed_message_ids), f)
+            logger.info(f"已保存 {len(self.processed_message_ids)} 个已处理的消息ID")
+        except Exception as e:
+            logger.error(f"保存已处理消息ID时出错: {str(e)}")
+
     def on_created(self, event):
         if not event.is_directory and event.src_path.endswith('.json'):
             logger.info(f"检测到新文件: {event.src_path}")
@@ -213,7 +239,10 @@ class MessageFileHandler(FileSystemEventHandler):
             traceback.print_exc()
         finally:
             self.current_processing_file = None
-            self.processing_lock.release()
+            try:
+                self.processing_lock.release()
+            except RuntimeError:
+                logger.warning("尝试释放未锁定的锁，这可能是由于并发问题导致的")
     
     def _cleanup_old_logs(self, emergency=False):
         """清理旧日志文件"""
@@ -369,6 +398,7 @@ class MessageFileHandler(FileSystemEventHandler):
                         if message_id:
                             self.processed_message_ids.add(message_id)
                         self.processed_content_hashes.add(content_hash)
+                        return  # 添加return语句，确保在失败时退出
             
             # 处理API分析结果
             if result:
@@ -401,6 +431,9 @@ class MessageFileHandler(FileSystemEventHandler):
                 # 记录已处理的消息ID和内容哈希
                 if message_id:
                     self.processed_message_ids.add(message_id)
+                    # 定期保存已处理的消息ID
+                    if len(self.processed_message_ids) % 100 == 0:  # 每处理100条消息保存一次
+                        self._save_processed_ids()
                 self.processed_content_hashes.add(content_hash)
                 
             else:
@@ -422,7 +455,8 @@ class MessageFileHandler(FileSystemEventHandler):
                 logger.info(f"清理处理记录缓存，当前大小: {len(self.processed_message_ids)}")
                 # 只保留最新的一半项目
                 self.processed_message_ids = set(list(self.processed_message_ids)[-self.max_processed_items//2:])
-                self.processed_content_hashes = set(list(self.processed_content_hashes)[-self.max_processed_items//2:])
+                # 保存清理后的ID列表
+                self._save_processed_ids()
             
         except Exception as e:
             logger.error(f"处理文件时出错 {file_path}: {str(e)}")
@@ -430,8 +464,14 @@ class MessageFileHandler(FileSystemEventHandler):
             # 记录已处理的消息ID和内容哈希，防止重复失败
             if 'message_id' in locals() and message_id:
                 self.processed_message_ids.add(message_id)
+                self._save_processed_ids()  # 保存更新后的ID列表
             if 'content_hash' in locals() and content_hash:
                 self.processed_content_hashes.add(content_hash)
+        finally:
+            # 确保在处理完成后清理状态
+            self.current_processing_file = None
+            if hasattr(self, 'processing_lock') and self.processing_lock.locked():
+                self.processing_lock.release()
     
     def _save_json_result(self, enriched_result, output_dir, channel_name):
         """保存JSON结果到文件"""
@@ -724,6 +764,7 @@ class MessageFileHandler(FileSystemEventHandler):
 
 class HistoricalMessageAnalyzer:
     def __init__(self, api_key: str):
+        """初始化分析器"""
         self.api_key = api_key
         self.base_url = "https://api.siliconflow.cn/v1"
         self.headers = {
@@ -733,6 +774,9 @@ class HistoricalMessageAnalyzer:
         
         # 配置具有重试机制的HTTP会话
         self.session = self._create_retry_session()
+        
+        # 添加消息ID追踪集合
+        self.processed_message_ids = set()
         
         # 默认分析提示词
         self.default_prompt = """
@@ -1912,59 +1956,8 @@ class HistoricalMessageAnalyzer:
 
     def should_analyze_message(self, msg: Dict, channel_name: str = None) -> bool:
         """判断消息是否需要分析"""
-        if not msg.get('content'):
-            return False
-            
-        content = msg['content']
-        
-        # 获取对应频道的筛选规则，如果没有则使用默认规则
-        filter_rules = self.channel_filters.get(channel_name, self.default_filter)
-        
-        # 特殊处理回复消息
-        is_reply = "**回复：" in content or content.strip().startswith(">")
-        
-        # 对回复消息进行内容提取
-        if is_reply:
-            # 尝试提取回复内容之后的部分作为实际内容
-            extracted_content = content
-            if "**回复：" in content and "**" in content.split("**回复：", 1)[1]:
-                reply_parts = content.split("**回复：", 1)[1].split("**", 1)
-                if len(reply_parts) > 1:
-                    extracted_content = reply_parts[1].strip()
-                    # 使用提取后的内容进行长度检查，降低要求
-                    if len(extracted_content) >= 5:
-                        # 只要有5个字符就尝试分析回复消息
-                        return True
-            
-            # 回复消息，大幅降低长度要求
-            min_length = 5  # 大幅降低长度要求
-        else:
-            # 非回复消息，略微降低长度要求
-            min_length = max(5, filter_rules["min_length"] - 5)  # 降低5个字符，但不低于5
-        
-        # 检查消息长度
-        if len(content.strip()) < min_length:
-            return False
-            
-        # 检查是否包含需要排除的关键词
-        if any(keyword in content.lower() for keyword in filter_rules["excluded_keywords"]):
-            return False
-            
-        # 检查是否包含必需的关键词（如果有设置）
-        if filter_rules["required_keywords"] and not any(keyword in content for keyword in filter_rules["required_keywords"]):
-            return False
-            
-        # 检查是否包含价格相关信息
-        has_price = any(indicator in content for indicator in filter_rules["price_indicators"])
-        
-        # 检查是否包含交易相关词汇
-        has_trading_terms = any(keyword in content.lower() for keyword in filter_rules["trading_keywords"])
-        
-        # 对于回复消息，放宽要求
-        if is_reply:
-            return True  # 对回复消息总是尝试分析
-        
-        return has_price or has_trading_terms
+        # 删除所有跳过逻辑，始终返回True
+        return True
 
     def preprocess_message(self, content: str) -> str:
         """消息预处理，增强可分析性"""
@@ -2055,6 +2048,11 @@ class HistoricalMessageAnalyzer:
             # 生成一个唯一的消息标识（对于太短消息的日志记录）
             msg_id = hashlib.md5((original + (translated or "")).encode('utf-8')).hexdigest()[:8]
             
+            # 检查是否已经处理过这个消息
+            if msg_id in self.processed_message_ids:
+                logger.info(f"消息 [ID:{msg_id}] 已处理过，跳过")
+                return None
+                
             # 特殊处理回复类消息（以"回复："或">"开头的消息）
             is_reply = False
             if "**回复：" in content_to_analyze or content_to_analyze.strip().startswith(">"):
@@ -2092,7 +2090,16 @@ class HistoricalMessageAnalyzer:
                     preview = f"**原文:**{original[:15]}..." if len(original) > 15 else original
                     preview += f" **翻译:**{translated[:15]}..." if translated and len(translated) > 15 else f" **翻译:**{translated}"
                     logger.warning(f"消息内容太短或为空，跳过分析 [ID:{msg_id}]: {preview}")
+                    # 将消息ID添加到已处理集合中
+                    self.processed_message_ids.add(msg_id)
                     return None
+                    
+            # 如果内容仍然为空，直接返回None
+            if not content_to_analyze or len(content_to_analyze.strip()) < min_length:
+                logger.warning(f"增强后的消息内容仍然太短，跳过分析 [ID:{msg_id}]")
+                # 将消息ID添加到已处理集合中
+                self.processed_message_ids.add(msg_id)
+                return None
             
             # 首先尝试使用正则表达式提取基本信息
             try:
@@ -2131,13 +2138,17 @@ class HistoricalMessageAnalyzer:
             # 准备API请求消息
             messages = [{"role": "user", "content": enhanced_prompt.format(content=content_to_analyze)}]
             
-            # API调用部分的错误处理在调用方法里处理
+            # 调用API进行分析
+            result = self._call_api_with_retry(messages, content_to_analyze, original, translated, extracted_info, channel_name, retry_count)
             
-            return self._call_api_with_retry(messages, content_to_analyze, original, translated, extracted_info, channel_name, retry_count)
-        
+            # 如果分析成功，将消息ID添加到已处理集合中
+            if result:
+                self.processed_message_ids.add(msg_id)
+            
+            return result
+            
         except Exception as e:
-            logger.error(f"分析消息时发生未捕获的异常: {str(e)}")
-            logger.error(f"消息内容: {content[:100]}...")
+            logger.error(f"分析消息时发生未捕获异常: {str(e)}")
             traceback.print_exc()
             return None
     

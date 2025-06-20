@@ -10,20 +10,30 @@ from decimal import Decimal
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from binance.enums import *
+import glob
+from Log import log_manager
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# 获取日志记录器
 logger = logging.getLogger(__name__)
 
+# 设置日志级别
+logger.setLevel(logging.WARNING)
+
+# 移除所有现有的处理器
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+# 添加处理器
+logger.addHandler(logging.StreamHandler())
+
 # 硬编码配置信息
+BINANCE_API_KEY = "VIJFNRp99K0dvJ7GEZFsnCVbuLhruo2H1Kh4xADeviXjegoV0NQKzFv8I2cSMcvF"
+BINANCE_API_SECRET = "jmEqAmrFYOhfnT65YFOvxn6nhOQ7TYw9pJlGltOY0xxDCyrZDrSQdiK9z4Yygc9a"
 
 # 交易配置
 TRADING_CONFIG = {
-    'position_size': 200,  # 固定交易金额（USDT）
-    'leverage': 5,       # 杠杆倍数
+    'position_size': 50,  # 固定交易金额（USDT）
+    'leverage': 20,       # 杠杆倍数
     'margin_type': 'CROSSED',  # 保证金类型：ISOLATED(逐仓) 或 CROSSED(全仓)
 }
 
@@ -48,6 +58,12 @@ class BinanceTrader:
         
         # 初始化币安客户端
         self.client = Client(self.api_key, self.api_secret)
+        
+        # 初始化BTC仓位配置
+        self.btc_initial_capital = 1000  # 初始资金1000U
+        self.btc_leverage = 60  # 60倍杠杆
+        self.btc_position_file = os.path.join(os.path.expanduser('~'), 'Desktop', 'btc仓位.xlsx')  # 修改为.xlsx文件
+        self.btc_channel_positions = self.load_btc_position_config()
         
         # 初始化时间偏移量
         self.time_offset = 0
@@ -74,13 +90,19 @@ class BinanceTrader:
         self.position_info = {}
         
         # 分析结果文件路径
-        self.analysis_file = os.path.join('data', 'analysis_results', 'all_analysis_results.csv')
+        self.analysis_file = os.path.join('C:\\', 'Users', 'Administrator', 'Desktop', 'Discord', 'data', 'analysis_results', 'all_analysis_results.csv')
         
         # 已执行订单记录文件
-        self.executed_orders_file = os.path.join('data', 'executed_orders.json')
+        self.executed_orders_file = os.path.join('C:\\', 'Users', 'Administrator', 'Desktop', 'Discord', 'data', 'executed_orders.json')
+        
+        # 订单配对关系文件
+        self.order_pairs_file = os.path.join('C:\\', 'Users', 'Administrator', 'Desktop', 'Discord', 'data', 'order_pairs.json')
         
         # 加载已执行的订单记录
         self.executed_signals = self.load_executed_signals()
+        
+        # 加载订单配对关系
+        self.order_pairs = self.load_order_pairs()
         
         # 清理过期的执行记录
         self.clean_expired_signals()
@@ -92,34 +114,48 @@ class BinanceTrader:
         try:
             # 检查当前持仓模式
             position_mode = self._request(self.client.futures_get_position_mode)
-            logger.info(f"当前持仓模式: {'双向持仓' if position_mode['dualSidePosition'] else '单向持仓'}")
+            is_hedge_mode = position_mode['dualSidePosition']
             
-            # 如果不是单向持仓，则设置为单向持仓
-            if position_mode['dualSidePosition']:
+            # 设置BTC和ETH为双向持仓，其他币种为单向持仓
+            if is_hedge_mode:
+                # 如果当前是对冲模式，先关闭对冲模式
                 self._request(self.client.futures_change_position_mode, dualSidePosition=False)
-                logger.info("已设置持仓模式为单向持仓")
+                logger.info("已关闭对冲模式")
+            
+            # 为BTC和ETH单独设置对冲模式
+            for symbol in ['BTCUSDT', 'ETHUSDT']:
+                try:
+                    self._request(self.client.futures_change_position_mode, dualSidePosition=True)
+                    logger.info(f"已为{symbol}设置对冲模式")
+                except Exception as e:
+                    logger.error(f"设置{symbol}对冲模式失败: {e}")
+            
+            logger.info(f"当前持仓模式: {'对冲模式' if is_hedge_mode else '单向持仓'}")
             
             # 设置保证金类型和杠杆
             for symbol_info in self.supported_symbols.values():
                 try:
+                    symbol = symbol_info['symbol']
                     # 先设置保证金类型
-                    self._request(self.client.futures_change_margin_type, symbol=symbol_info['symbol'], marginType=self.trading_config['margin_type'])
-                    logger.info(f"已设置{symbol_info['symbol']}保证金类型为{self.trading_config['margin_type']}")
+                    self._request(self.client.futures_change_margin_type, symbol=symbol, marginType=self.trading_config['margin_type'])
+                    logger.info(f"已设置{symbol}保证金类型为{self.trading_config['margin_type']}")
                     
                     # 再设置杠杆倍数
-                    self._request(self.client.futures_change_leverage, symbol=symbol_info['symbol'], leverage=self.trading_config['leverage'])
-                    logger.info(f"已设置{symbol_info['symbol']}杠杆倍数为{self.trading_config['leverage']}倍")
-                    
-                except BinanceAPIException as e:
-                    if e.code == -4046:  # 保证金类型已经是目标类型
-                        logger.info(f"{symbol_info['symbol']}保证金类型已经是{self.trading_config['margin_type']}")
-                    elif e.code == -4047:  # 杠杆已经是目标倍数
-                        logger.info(f"{symbol_info['symbol']}杠杆倍数已经是{self.trading_config['leverage']}倍")
+                    if symbol in ['BTCUSDT', 'ETHUSDT']:
+                        self._request(self.client.futures_change_leverage, symbol=symbol, leverage=self.btc_leverage)
+                        logger.info(f"已设置{symbol}杠杆倍数为{self.btc_leverage}倍")
                     else:
-                        logger.error(f"设置{symbol_info['symbol']}合约参数时出错: {e}")
-            
-        except BinanceAPIException as e:
-            logger.error(f"初始化合约设置时出错: {e}")
+                        self._request(self.client.futures_change_leverage, symbol=symbol, leverage=self.trading_config['leverage'])
+                        logger.info(f"已设置{symbol}杠杆倍数为{self.trading_config['leverage']}倍")
+                        
+                except BinanceAPIException as e:
+                    if e.code not in [-4046, -4047]:  # 忽略"已经是目标类型/倍数"的错误
+                        raise
+                    else:
+                        logger.info(f"保证金类型或杠杆倍数已经是目标值: {e}")
+                        
+        except Exception as e:
+            logger.error(f"设置账户持仓模式失败: {e}")
         
         logger.info("币安合约交易客户端初始化完成")
     
@@ -168,17 +204,40 @@ class BinanceTrader:
 
     def get_account_info(self) -> Dict:
         """
-        获取合约账户信息
+        获取账户信息
         
         Returns:
             Dict: 账户信息
         """
         try:
-            return self._request(self.client.futures_account)
-        except BinanceAPIException as e:
-            logger.error(f"获取合约账户信息失败: {e}")
+            account = self._request(self.client.futures_account)
+            if not account:
+                logger.error("无法获取账户信息")
+                return {}
+                
+            # 获取USDT余额
+            assets = account.get('assets', [])
+            usdt_asset = next((asset for asset in assets if asset['asset'] == 'USDT'), None)
+            
+            if not usdt_asset:
+                logger.error("无法获取USDT资产信息")
+                return {}
+                
+            # 计算可用余额
+            available_balance = float(usdt_asset.get('availableBalance', 0))
+            wallet_balance = float(usdt_asset.get('walletBalance', 0))
+            
+            logger.info(f"账户信息:\n  钱包余额: {wallet_balance:.2f} USDT\n  可用余额: {available_balance:.2f} USDT")
+            
+            return {
+                'availableBalance': available_balance,
+                'walletBalance': wallet_balance
+            }
+            
+        except Exception as e:
+            logger.error(f"获取账户信息失败: {e}")
             return {}
-    
+
     def get_balance(self, asset: str = 'USDT') -> float:
         """
         获取指定资产的合约余额
@@ -240,7 +299,12 @@ class BinanceTrader:
             # 使用期货API获取价格
             ticker = self._request(self.client.futures_symbol_ticker, symbol=base_symbol)
             price = float(ticker['price'])
-            logger.info(f"获取{base_symbol}期货价格: {price}")
+            
+            # 检查价格有效性
+            if not price or price <= 0:
+                logger.error(f"获取到{symbol}无效价格: {price}")
+                return None
+                
             return price
         except Exception as e:
             logger.error(f"获取{symbol}当前价格失败: {e}")
@@ -282,6 +346,8 @@ class BinanceTrader:
             if isinstance(symbol, dict):
                 symbol = symbol['symbol']
                 
+            logger.info(f"开始格式化数量: symbol={symbol}, quantity={quantity}")
+            
             # 获取交易对信息
             symbol_info = None
             for key, value in SUPPORTED_SYMBOLS.items():
@@ -291,18 +357,26 @@ class BinanceTrader:
             
             if not symbol_info:
                 raise ValueError(f"不支持的交易对: {symbol}")
+                
+            logger.info(f"找到交易对信息: {symbol_info}")
             
             # 获取当前价格
             current_price = self.get_current_price(symbol)
             if not current_price:
                 raise ValueError(f"无法获取{symbol}当前价格")
+                
+            logger.info(f"当前价格: {current_price}")
             
             # 格式化数量
             precision = symbol_info['quantity_precision']
             min_qty = symbol_info['min_qty']
             
+            logger.info(f"数量精度: {precision}, 最小数量: {min_qty}")
+            
             # 确保数量不小于最小交易量
-            quantity = max(quantity, min_qty)
+            if quantity < min_qty:
+                logger.warning(f"数量 {quantity} 小于最小交易量 {min_qty}，将使用最小交易量")
+                quantity = min_qty
             
             # 根据精度格式化
             if precision == 0:
@@ -310,9 +384,13 @@ class BinanceTrader:
                 formatted_qty = int(quantity)
             else:
                 formatted_qty = float(f"{{:.{precision}f}}".format(quantity))
+                
+            logger.info(f"格式化后的数量: {formatted_qty}")
             
             # 验证名义金额是否满足要求
             notional = formatted_qty * current_price
+            logger.info(f"计算的名义金额: {notional} USDT")
+            
             if notional < 100:
                 # 如果名义金额小于100，增加数量
                 formatted_qty = 100 / current_price
@@ -321,7 +399,19 @@ class BinanceTrader:
                 else:
                     formatted_qty = float(f"{{:.{precision}f}}".format(formatted_qty))
                 logger.info(f"调整交易数量以满足最小名义金额要求: {formatted_qty}")
+                
+                # 重新计算名义金额
+                notional = formatted_qty * current_price
+                logger.info(f"调整后的名义金额: {notional} USDT")
             
+            # 最终验证
+            if formatted_qty <= 0:
+                raise ValueError(f"格式化后的数量无效: {formatted_qty}")
+                
+            if notional < 100:
+                raise ValueError(f"名义金额 {notional} USDT 小于最小要求 100 USDT")
+                
+            logger.info(f"最终格式化结果: quantity={formatted_qty}, notional={notional} USDT")
             return formatted_qty
             
         except Exception as e:
@@ -344,6 +434,10 @@ class BinanceTrader:
             if isinstance(symbol, dict):
                 symbol = symbol['symbol']
                 
+            # 验证价格
+            if not price or price <= 0:
+                raise ValueError(f"价格必须大于0: {price}")
+                
             # 获取交易对信息
             symbol_info = None
             for key, value in SUPPORTED_SYMBOLS.items():
@@ -352,13 +446,19 @@ class BinanceTrader:
                     break
             
             if not symbol_info:
-                logger.warning(f"未找到交易对 {symbol} 的精度信息，使用原始价格")
-                return price
+                logger.warning(f"未找到交易对 {symbol} 的精度信息，使用默认精度4")
+                precision = 4
+            else:
+                precision = symbol_info['price_precision']
             
             # 格式化价格
-            precision = symbol_info['price_precision']
             formatted_price = float(f"{{:.{precision}f}}".format(price))
             
+            # 验证格式化后的价格
+            if not formatted_price or formatted_price <= 0:
+                raise ValueError(f"格式化后的价格无效: {formatted_price}")
+                
+            logger.info(f"价格格式化: 原始价格={price}, 格式化后={formatted_price}, 精度={precision}")
             return formatted_price
             
         except Exception as e:
@@ -373,7 +473,8 @@ class BinanceTrader:
                    price: float = None,
                    stop_price: float = None,
                    time_in_force: str = 'GTC',
-                   notional: float = None) -> Dict:
+                   notional: float = None,
+                   reduceOnly: bool = False) -> Dict:
         """
         下合约单
         
@@ -386,13 +487,13 @@ class BinanceTrader:
             stop_price: 触发价格（止损/止盈单需要）
             time_in_force: 订单有效期
             notional: 名义金额（可选）
+            reduceOnly: 是否只减仓（可选）
             
         Returns:
             Dict: 订单信息
         """
         try:
             logger.info(f"准备下单: {symbol} {side} {order_type}")
-            logger.info(f"当前支持的交易对: {list(self.supported_symbols.keys())}")
             
             # 检查当前持仓模式
             position_mode = self._request(self.client.futures_get_position_mode)
@@ -424,7 +525,6 @@ class BinanceTrader:
             
             if not symbol_info:
                 logger.error(f"交易对 {symbol} 不在支持列表中")
-                logger.error(f"当前支持的交易对: {list(self.supported_symbols.keys())}")
                 raise ValueError(f"不支持的交易对: {symbol}")
             
             logger.info(f"找到交易对信息: {symbol_info}")
@@ -436,6 +536,31 @@ class BinanceTrader:
             if stop_price:
                 stop_price = self.format_price(symbol, stop_price)
                 logger.info(f"格式化后的止损价格: {stop_price}")
+            # 如果 price 没有传递或为0，自动用当前市场价兜底
+            if not price or price == 0:
+                price = self.get_current_price(symbol)
+                logger.warning(f"未传递价格，自动使用当前市场价: {price}")
+            
+            # 如果是止损单或止盈单，检查价格是否合适
+            if order_type in ['STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP_LIMIT', 'TAKE_PROFIT_LIMIT']:
+                if not stop_price:
+                    raise ValueError(f"{order_type}订单必须提供stopPrice参数")
+                
+                # 获取当前市场价格
+                current_price = self.get_current_price(symbol)
+                if not current_price:
+                    raise ValueError(f"无法获取{symbol}当前价格")
+                
+                # 检查止损价格是否合适
+                price_diff_percent = abs(stop_price - current_price) / current_price
+                if price_diff_percent < 0.001:  # 如果价格差异小于0.1%
+                    raise ValueError(f"止损价格 {stop_price} 太接近当前价格 {current_price}，差异: {price_diff_percent*100:.2f}%")
+                
+                # 检查止损价格方向是否正确
+                if side == 'BUY' and stop_price >= current_price:
+                    raise ValueError(f"买单的止损价格 {stop_price} 不能高于当前价格 {current_price}")
+                elif side == 'SELL' and stop_price <= current_price:
+                    raise ValueError(f"卖单的止损价格 {stop_price} 不能低于当前价格 {current_price}")
             
             # 构建订单参数
             params = {
@@ -449,72 +574,70 @@ class BinanceTrader:
                 # 对冲模式下，需要设置positionSide
                 params['positionSide'] = 'LONG' if side == 'BUY' else 'SHORT'
                 logger.info(f"对冲模式，设置positionSide: {params['positionSide']}")
+            else:
+                # 非对冲模式下，才设置reduceOnly
+                params['reduceOnly'] = reduceOnly
+            
+            # 如果是止损单或止盈单，添加stopPrice参数
+            if order_type in ['STOP_MARKET', 'TAKE_PROFIT_MARKET', 'STOP_LIMIT', 'TAKE_PROFIT_LIMIT']:
+                params['stopPrice'] = stop_price
+                params['workingType'] = 'MARK_PRICE'  # 使用标记价格作为触发价格
             
             # 如果提供了名义金额，使用名义金额下单
             if notional:
                 # 获取当前价格用于计算数量
                 current_price = self.get_current_price(symbol)
-                if not current_price:
-                    raise ValueError(f"无法获取{symbol}当前价格")
+                if not current_price or current_price <= 0:  # 添加除零检查
+                    raise ValueError(f"无法获取{symbol}当前价格或价格无效: {current_price}")
                 
-                logger.info(f"使用名义金额下单: {notional} USDT")
-                logger.info(f"当前价格: {current_price}")
-                
-                # 计算最小所需数量以满足200 USDT的名义金额要求
-                min_quantity = notional / current_price
-                
-                # 根据精度格式化数量
-                precision = symbol_info['quantity_precision']
-                if precision == 0:
-                    # 对于整数精度的币种，向上取整并加1
-                    min_quantity = int(min_quantity) + 1
-                else:
-                    # 对于小数精度的币种，增加5%的余量以确保超过最小要求
-                    min_quantity = min_quantity * 1.05
-                    min_quantity = float(f"{{:.{precision}f}}".format(min_quantity))
-                
-                # 验证名义金额是否满足要求
-                actual_notional = min_quantity * current_price
-                if actual_notional < notional:
-                    # 如果仍然不满足要求，继续增加数量
-                    min_quantity = notional / current_price
-                    if precision == 0:
-                        min_quantity = int(min_quantity) + 1
+                try:
+                    # 计算数量
+                    quantity = notional / current_price
+                    if not quantity or quantity <= 0:
+                        raise ValueError(f"计算出的数量无效: {quantity}")
+                        
+                    quantity = self.format_quantity(symbol, quantity)
+                    logger.info(f"使用当前价格 {current_price} 计算数量: {quantity}")
+                    
+                    # 确保quantity参数被正确设置
+                    params['quantity'] = quantity
+                    
+                    # 根据订单类型设置不同的参数
+                    if order_type in ['STOP_LIMIT', 'TAKE_PROFIT']:
+                        params['type'] = order_type
+                        params['stopPrice'] = stop_price
+                        params['workingType'] = 'MARK_PRICE'
+                        params['price'] = price
                     else:
-                        min_quantity = min_quantity * 1.05
-                        min_quantity = float(f"{{:.{precision}f}}".format(min_quantity))
-                
-                # 使用计算出的最小数量
-                quantity = min_quantity
-                logger.info(f"计算出的交易数量: {quantity} (名义金额: {quantity * current_price:.2f} USDT)")
-                
-                params['quantity'] = quantity
-                
-                # 根据订单类型设置不同的参数
-                if order_type in ['STOP_MARKET', 'TAKE_PROFIT_MARKET']:
-                    # 止损/止盈单使用市价单
-                    params['type'] = order_type
-                    params['stopPrice'] = stop_price
-                    params['workingType'] = 'MARK_PRICE'
-                else:
-                    # 其他订单使用限价单
-                    if not price:
-                        raise ValueError("使用名义金额下单时必须提供价格")
-                    params['type'] = 'LIMIT'
-                    params['timeInForce'] = 'GTC'
-                    params['price'] = price
+                        if not price:
+                            raise ValueError("使用名义金额下单时必须提供价格")
+                        params['type'] = 'LIMIT'
+                        params['timeInForce'] = 'GTC'
+                        params['price'] = price
+                        
+                    # 计算实际保证金
+                    actual_margin = notional / self.trading_config['leverage']
+                    logger.info(f"名义金额: {notional} USDT, 实际保证金: {actual_margin} USDT")
+                    
+                except ZeroDivisionError:
+                    raise ValueError(f"计算数量时发生除零错误，当前价格: {current_price}")
+                except Exception as e:
+                    raise ValueError(f"计算数量时发生错误: {str(e)}")
             else:
                 # 否则使用数量下单
-                if quantity:
-                    quantity = self.format_quantity(symbol, quantity)
-                    params['quantity'] = quantity
-                    # 只有在使用数量下单时才添加timeInForce
-                    if order_type in ['LIMIT', 'STOP_LIMIT']:
-                        params['timeInForce'] = time_in_force
-                        params['price'] = price
-                    # 只有在使用数量下单时才添加reduceOnly和closePosition
-                    params['reduceOnly'] = False
-                    params['closePosition'] = False
+                if not quantity:
+                    raise ValueError("必须提供quantity或notional参数")
+                quantity = self.format_quantity(symbol, quantity)
+                if not quantity or quantity <= 0:
+                    raise ValueError(f"格式化后的数量无效: {quantity}")
+                    
+                params['quantity'] = quantity
+                if order_type in ['LIMIT', 'STOP_LIMIT', 'TAKE_PROFIT']:
+                    params['timeInForce'] = time_in_force
+                    params['price'] = price
+                    if order_type in ['STOP_LIMIT', 'TAKE_PROFIT']:
+                        params['stopPrice'] = stop_price
+                        params['workingType'] = 'MARK_PRICE'
             
             logger.info(f"最终订单参数: {params}")
             
@@ -570,50 +693,221 @@ class BinanceTrader:
             logger.error(f"获取合约订单状态失败: {e}")
             return {}
     
-    def place_market_order(self, symbol: str, side: str, quantity: float) -> Dict:
+    def place_market_order(self, symbol: str, side: str, quantity: float = None, notional: float = None) -> Dict:
         """
-        下合约市价单
+        下市价单
         
         Args:
-            symbol: 交易对符号
+            symbol: 交易对
             side: 方向 (BUY/SELL)
             quantity: 数量
+            notional: 名义金额
             
         Returns:
             Dict: 订单信息
         """
-        return self.place_order(symbol, side, 'MARKET', quantity)
-    
-    def place_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Dict:
+        try:
+            # 获取当前持仓模式
+            position_mode = self._request(self.client.futures_get_position_mode)
+            is_hedge_mode = position_mode['dualSidePosition']
+            
+            # 设置positionSide
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            if is_hedge_mode and symbol in ['BTCUSDT', 'ETHUSDT']:
+                logger.info(f"对冲模式，设置positionSide: {position_side}")
+            else:
+                position_side = 'BOTH'
+                logger.info("单向持仓模式，设置positionSide: BOTH")
+            
+            # 构建订单参数
+            params = {
+                'symbol': symbol,
+                'side': side,
+                'type': 'MARKET'
+            }
+            
+            # 如果提供了notional，使用notional下单
+            if notional:
+                params['notional'] = notional
+            # 否则使用quantity
+            else:
+                if not quantity:
+                    raise ValueError("使用quantity时必须提供数量")
+                params['quantity'] = quantity
+            
+            # 只在BTC和ETH的对冲模式下设置positionSide
+            if is_hedge_mode and symbol in ['BTCUSDT', 'ETHUSDT']:
+                params['positionSide'] = position_side
+            
+            logger.info(f"最终订单参数: {params}")
+            return self._request(self.client.futures_create_order, **params)
+            
+        except Exception as e:
+            logger.error(f"下合约单失败: {e}")
+            raise
+
+    def place_limit_order(self, symbol: str, side: str, quantity: float = None, price: float = None, notional: float = None) -> Dict:
         """
-        下合约限价单
+        下限价单
         
         Args:
-            symbol: 交易对符号
+            symbol: 交易对
             side: 方向 (BUY/SELL)
             quantity: 数量
             price: 价格
+            notional: 名义金额
             
         Returns:
             Dict: 订单信息
         """
-        return self.place_order(symbol, side, 'LIMIT', quantity, price=price)
-    
+        try:
+            # 获取当前持仓模式
+            position_mode = self._request(self.client.futures_get_position_mode)
+            is_hedge_mode = position_mode['dualSidePosition']
+            logger.info(f"当前持仓模式: {'对冲模式' if is_hedge_mode else '单向持仓模式'}")
+            
+            # 对于非BTC/ETH交易对，确保使用单向持仓模式
+            if symbol not in ['BTCUSDT', 'ETHUSDT'] and is_hedge_mode:
+                logger.info(f"非BTC/ETH交易对，切换到单向持仓模式")
+                self._request(self.client.futures_change_position_mode, dualSidePosition=False)
+                logger.info("已切换到单向持仓模式")
+            
+            # 构建订单参数
+            params = {
+                'symbol': symbol,
+                'side': side,
+                'type': 'LIMIT',
+                'timeInForce': 'GTC'
+            }
+            
+            # 获取当前市场价格
+            current_price = self.get_current_price(symbol)
+            if not current_price or current_price <= 0:
+                raise ValueError(f"无法获取{symbol}当前价格或价格无效: {current_price}")
+            
+            logger.info(f"当前市场价格: {current_price}")
+            
+            # 验证价格是否在允许范围内
+            if price:
+                # 获取价格精度
+                symbol_info = None
+                for key, value in self.supported_symbols.items():
+                    if value['symbol'] == symbol:
+                        symbol_info = value
+                        break
+                
+                if not symbol_info:
+                    raise ValueError(f"不支持的交易对: {symbol}")
+                
+                # 格式化价格
+                price = self.format_price(symbol, price)
+                logger.info(f"格式化后的价格: {price}")
+                
+                # 检查价格是否在允许范围内
+                if side == 'BUY':
+                    if price > current_price * 1.1:  # 买单价格不能高于当前价格的110%
+                        raise ValueError(f"买单价格 {price} 不能高于当前价格 {current_price} 的110%")
+                else:  # SELL
+                    if price < current_price * 0.9:  # 卖单价格不能低于当前价格的90%
+                        raise ValueError(f"卖单价格 {price} 不能低于当前价格 {current_price} 的90%")
+            else:
+                # 如果没有提供价格，使用当前市场价格
+                price = current_price
+                logger.info(f"未提供价格，使用当前市场价格: {price}")
+            
+            params['price'] = price
+            
+            # 如果提供了notional，使用notional计算quantity
+            if notional:
+                logger.info(f"使用notional下单: notional={notional}, price={price}, current_price={current_price}")
+                
+                # 计算数量
+                quantity = notional / price
+                if not quantity or quantity <= 0:
+                    raise ValueError(f"计算出的数量无效: {quantity}")
+                    
+                # 格式化数量
+                quantity = self.format_quantity(symbol, quantity)
+                if not quantity or quantity <= 0:
+                    raise ValueError(f"格式化后的数量无效: {quantity}")
+                
+                logger.info(f"使用价格 {price} 计算数量: {quantity}")
+                
+                # 设置参数
+                params['quantity'] = quantity
+                
+                # 计算实际保证金
+                actual_margin = notional / self.trading_config['leverage']
+                logger.info(f"名义金额: {notional} USDT, 实际保证金: {actual_margin} USDT")
+            else:
+                # 使用quantity和price
+                if not quantity:
+                    raise ValueError("使用quantity时必须提供数量")
+                if quantity <= 0:
+                    raise ValueError(f"数量必须大于0: {quantity}")
+                    
+                # 格式化数量
+                quantity = self.format_quantity(symbol, quantity)
+                if not quantity or quantity <= 0:
+                    raise ValueError(f"格式化后的数量无效: {quantity}")
+                
+                params['quantity'] = quantity
+            
+            logger.info(f"最终订单参数: {params}")
+            return self._request(self.client.futures_create_order, **params)
+            
+        except Exception as e:
+            logger.error(f"下合约单失败: {e}")
+            raise
+
     def place_stop_loss_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> Dict:
         """
-        下合约止损单
+        下止损单
         
         Args:
-            symbol: 交易对符号
+            symbol: 交易对
             side: 方向 (BUY/SELL)
             quantity: 数量
-            stop_price: 触发价格
+            stop_price: 止损价格
             
         Returns:
             Dict: 订单信息
         """
-        return self.place_order(symbol, side, 'STOP_MARKET', quantity, stop_price=stop_price)
-    
+        try:
+            # 获取当前持仓模式
+            position_mode = self._request(self.client.futures_get_position_mode)
+            is_hedge_mode = position_mode['dualSidePosition']
+            
+            # 设置positionSide
+            position_side = 'LONG' if side == 'BUY' else 'SHORT'
+            if is_hedge_mode:
+                logger.info(f"对冲模式，设置positionSide: {position_side}")
+            else:
+                position_side = 'BOTH'
+                logger.info("单向持仓模式，设置positionSide: BOTH")
+            
+            # 使用STOP_MARKET替代STOP_LIMIT
+            params = {
+                'symbol': symbol,
+                'side': side,
+                'type': 'STOP_MARKET',
+                'stopPrice': stop_price,
+                'workingType': 'MARK_PRICE',
+                'quantity': quantity,
+                'timeInForce': 'GTC',
+                'reduceOnly': True
+            }
+            
+            if is_hedge_mode:
+                params['positionSide'] = position_side
+            
+            logger.info(f"最终订单参数: {params}")
+            return self._request(self.client.futures_create_order, **params)
+            
+        except Exception as e:
+            logger.error(f"下止损单失败: {e}")
+            raise
+
     def place_take_profit_order(self, symbol: str, side: str, quantity: float, stop_price: float) -> Dict:
         """
         下合约止盈单
@@ -627,7 +921,7 @@ class BinanceTrader:
         Returns:
             Dict: 订单信息
         """
-        return self.place_order(symbol, side, 'TAKE_PROFIT_MARKET', quantity, stop_price=stop_price)
+        return self.place_order(symbol, side, 'TAKE_PROFIT_LIMIT', quantity, stop_price=stop_price, price=stop_price)
     
     def update_trading_config(self, config: Dict):
         """
@@ -697,163 +991,125 @@ class BinanceTrader:
 
     def read_trading_signals(self) -> List[Dict]:
         """
-        读取交易信号文件
-        
-        Returns:
-            List[Dict]: 交易信号列表
+        读取交易信号，只读取最近4小时的信号
         """
         try:
-            if not os.path.exists(self.analysis_file):
-                logger.warning(f"分析结果文件不存在: {self.analysis_file}")
+            # 获取最新的分析结果文件
+            analysis_dir = os.path.join('C:\\', 'Users', 'Administrator', 'Desktop', 'Discord', 'data', 'analysis_results')
+            if not os.path.exists(analysis_dir):
+                logger.warning(f"分析结果目录不存在: {analysis_dir}")
                 return []
-            
-            # 尝试不同的编码方式读取CSV文件
-            encodings = ['utf-8', 'gbk', 'gb2312', 'gb18030', 'latin1']
-            df = None
-            
-            for encoding in encodings:
-                try:
-                    df = pd.read_csv(self.analysis_file, encoding=encoding)
-                    logger.info(f"成功使用 {encoding} 编码读取文件")
-                    break
-                except UnicodeDecodeError:
-                    continue
-                except Exception as e:
-                    logger.error(f"使用 {encoding} 编码读取文件时出错: {e}")
-                    continue
-            
-            if df is None:
-                logger.error("无法使用任何编码方式读取文件")
+                
+            files = [f for f in os.listdir(analysis_dir) if f.endswith('.csv')]
+            if not files:
+                logger.warning(f"未找到分析结果文件: {analysis_dir}")
                 return []
+                
+            latest_file = max(files, key=lambda x: os.path.getctime(os.path.join(analysis_dir, x)))
+            file_path = os.path.join(analysis_dir, latest_file)
+            logger.info(f"读取最新的分析结果文件: {file_path}")
             
-            # 获取必要的列
-            required_columns = ['analysis.交易币种', 'analysis.方向', 'analysis.入场点位1', 'analysis.止损点位1']
-            if not all(col in df.columns for col in required_columns):
-                logger.error("CSV文件缺少必要的列")
-                return []
+            # 读取CSV文件
+            df = pd.read_csv(file_path)
             
-            # 过滤出有效的交易信号
+            # 过滤出有效的分析结果
+            df = df[df['analysis.分析失败'].isna()]
+            
+            # 获取当前时间
+            current_time = pd.Timestamp.now()
+            
             signals = []
             for _, row in df.iterrows():
                 try:
-                    # 检查所有必要字段是否都存在且有效
-                    if any(pd.isna(row[col]) for col in required_columns):
+                    # 检查信号时间是否在最近4小时内
+                    signal_time = pd.to_datetime(row['timestamp'])
+                    if (current_time - signal_time).total_seconds() > 4 * 3600:  # 4小时 = 4 * 3600秒
                         continue
                         
-                    # 获取交易币种
-                    symbol = str(row['analysis.交易币种']).strip().upper()
-                    if not symbol or symbol == 'NAN':
+                    # 检查交易币种
+                    symbol = row['analysis.交易币种']
+                    if pd.isna(symbol):
                         continue
-                    
-                    logger.info(f"处理交易信号: {symbol}")
-                    logger.info(f"当前支持的交易对: {list(SUPPORTED_SYMBOLS.keys())}")
-                    
-                    # 标准化交易对
-                    normalized_symbol = None
-                    # 移除可能的后缀（如USDT）
-                    base_symbol = symbol.replace('USDT', '').strip()
-                    logger.info(f"基础币种: {base_symbol}")
-                    
-                    # 特殊处理BTC和ETH
-                    if base_symbol.startswith('BTC'):
-                        normalized_symbol = 'BTCUSDT'
-                        logger.info(f"BTC交易对标准化为: {normalized_symbol}")
-                    elif base_symbol.startswith('ETH'):
-                        normalized_symbol = 'ETHUSDT'
-                        logger.info(f"ETH交易对标准化为: {normalized_symbol}")
-                    else:
-                        # 检查是否在支持的交易对中
-                        if base_symbol in SUPPORTED_SYMBOLS:
-                            normalized_symbol = SUPPORTED_SYMBOLS[base_symbol]['symbol']
-                            logger.info(f"找到匹配的交易对: {normalized_symbol}")
-                        else:
-                            # 尝试直接匹配完整的交易对
-                            for base, info in SUPPORTED_SYMBOLS.items():
-                                if info['symbol'] == symbol:
-                                    normalized_symbol = symbol
-                                    logger.info(f"通过完整匹配找到交易对: {normalized_symbol}")
-                                    break
-                    
-                    if not normalized_symbol:
+                        
+                    # 检查是否支持该交易对
+                    if not self.is_symbol_supported(symbol):
                         logger.warning(f"不支持的交易对: {symbol}")
                         continue
-                    
-                    # 获取方向
-                    direction = str(row['analysis.方向']).strip()
-                    if '空' in direction or 'short' in direction.lower() or 'sell' in direction.lower():
-                        side = 'SELL'
-                    else:
-                        side = 'BUY'
-                    
-                    # 获取入场价格
-                    try:
-                        entry_price = float(row['analysis.入场点位1'])
-                        if entry_price <= 0:
-                            continue
-                    except (ValueError, TypeError):
+                        
+                    # 检查方向
+                    direction = row['analysis.方向']
+                    if pd.isna(direction):
                         continue
-                    
-                    # 获取止损价格
-                    try:
-                        stop_loss = float(row['analysis.止损点位1'])
-                        if stop_loss <= 0:
-                            continue
-                    except (ValueError, TypeError):
+                        
+                    # 转换方向
+                    side = 'BUY' if direction == '做多' else 'SELL' if direction == '做空' else None
+                    if not side:
                         continue
-                    
-                    # 获取止盈价格（如果有）
+                        
+                    # 检查入场价格
+                    entry_price = row['analysis.入场点位1']
+                    if pd.isna(entry_price):
+                        continue
+                    try:
+                        entry_price = float(entry_price)
+                    except (ValueError, TypeError):
+                        logger.warning(f"无效的入场价格: {entry_price}")
+                        continue
+                        
+                    # 检查止损价格
+                    stop_loss = row['analysis.止损点位1']
+                    if pd.isna(stop_loss):
+                        continue
+                    try:
+                        stop_loss = float(stop_loss)
+                    except (ValueError, TypeError):
+                        logger.warning(f"无效的止损价格: {stop_loss}")
+                        continue
+                        
+                    # 检查止盈价格
                     target_price = None
-                    target_cols = [col for col in df.columns if '止盈' in col or '目标' in col.lower()]
-                    for col in target_cols:
-                        if not pd.isna(row[col]):
+                    for i in range(1, 4):
+                        target_col = f'analysis.止盈点位{i}'
+                        if target_col in row and not pd.isna(row[target_col]):
                             try:
-                                target_price = float(row[col])
-                                if target_price > 0:
-                                    break
+                                target_price = float(row[target_col])
+                                break
                             except (ValueError, TypeError):
+                                logger.warning(f"无效的止盈价格: {row[target_col]}")
                                 continue
                     
-                    # 验证价格关系
-                    if side == 'BUY':
-                        if stop_loss >= entry_price:
-                            logger.warning(f"做多信号价格关系无效: 止损 {stop_loss} >= 入场 {entry_price}")
+                    # 检查频道
+                    channel = row['channel']
+                    if pd.isna(channel):
+                        continue
+                        
+                    # 如果是BTC，检查是否在配置中
+                    if symbol == 'BTCUSDT':
+                        if channel not in self.btc_channel_positions:
                             continue
-                        if target_price and target_price <= entry_price:
-                            logger.warning(f"做多信号止盈价格无效: 止盈 {target_price} <= 入场 {entry_price}")
-                            continue
-                    else:  # SELL
-                        if stop_loss <= entry_price:
-                            logger.warning(f"做空信号价格关系无效: 止损 {stop_loss} <= 入场 {entry_price}")
-                            continue
-                        if target_price and target_price >= entry_price:
-                            logger.warning(f"做空信号止盈价格无效: 止盈 {target_price} >= 入场 {entry_price}")
-                            continue
-                    
-                    # 创建交易信号
+                            
+                    # 创建信号
                     signal = {
-                        'symbol': normalized_symbol,
+                        'symbol': f"{symbol}USDT",
                         'side': side,
                         'entry_price': entry_price,
                         'stop_loss': stop_loss,
-                        'target_price': target_price  # 可能为None
+                        'target_price': target_price,
+                        'channel': channel,
+                        'timestamp': row['timestamp']
                     }
                     
-                    # 检查信号是否已执行
-                    if self.is_signal_executed(signal):
-                        logger.info(f"跳过已执行的信号: {signal}")
-                        continue
-                    
                     signals.append(signal)
-                    logger.info(f"添加新交易信号: {signal}")
+                    logger.info(f"添加交易信号: {signal}")
                     
                 except Exception as e:
-                    logger.error(f"处理交易信号时出错: {e}")
+                    logger.error(f"处理信号时出错: {e}, 行数据: {row.to_dict()}")
                     continue
-            
+                    
             return signals
             
         except Exception as e:
-            logger.error(f"读取交易信号文件时出错: {e}")
+            logger.error(f"读取交易信号时出错: {e}")
             return []
 
     def check_balance_sufficient(self, symbol: str, notional: float) -> bool:
@@ -898,21 +1154,24 @@ class BinanceTrader:
 
     def get_signal_key(self, signal: Dict) -> str:
         """
-        生成交易信号的唯一标识
-        
-        Args:
-            signal: 交易信号字典
-            
-        Returns:
-            str: 信号唯一标识
+        生成信号唯一标识
         """
-        # 格式化价格，确保精度一致
-        entry_price = self.format_price(signal['symbol'], signal['entry_price'])
-        
-        # 只使用交易对、方向和入场价格作为标识
-        signal_key = f"{signal['symbol']}_{signal['side']}_{entry_price}"
-        logger.info(f"生成信号标识: {signal_key}")
-        return signal_key
+        try:
+            symbol = signal.get('symbol', '')
+            side = signal.get('side', '')
+            entry_price = signal.get('entry_price', 0)
+            stop_loss = signal.get('stop_loss', 0)
+            target_price = signal.get('target_price', 0)
+            channel = signal.get('channel', '')
+            timestamp = signal.get('timestamp', '')
+            
+            # 生成唯一标识
+            key = f"{symbol}_{side}_{entry_price}_{stop_loss}_{target_price}_{channel}_{timestamp}"
+            return key
+            
+        except Exception as e:
+            logger.error(f"生成信号标识时出错: {e}")
+            return ""
 
     def is_signal_executed(self, signal: Dict) -> bool:
         """
@@ -933,6 +1192,15 @@ class BinanceTrader:
             if current_time - last_execution_time < 4 * 3600:  # 4小时 = 4 * 3600秒
                 logger.info(f"信号 {signal_key} 在4小时内已执行过，跳过")
                 return True
+        
+        # 检查是否有相同特征的订单在4小时内执行过（忽略时间戳）
+        base_key = '_'.join(signal_key.split('_')[:-1])  # 移除时间戳部分
+        for key in self.executed_signals.keys():
+            if key.startswith(base_key):
+                last_execution_time = self.executed_signals[key]
+                if current_time - last_execution_time < 4 * 3600:
+                    logger.info(f"发现相似信号 {key} 在4小时内已执行过，跳过")
+                    return True
         
         return False
 
@@ -982,6 +1250,15 @@ class BinanceTrader:
                             logger.info(f"发现相同信号的挂单: {order}")
                             return True
             
+            # 检查订单配对关系中是否有相同信号的活跃订单
+            for pair in self.order_pairs.values():
+                if pair['status'] == 'active':
+                    if (pair['symbol'] == symbol and 
+                        pair['side'] == side and 
+                        abs(float(pair['entry_price']) - entry_price) / entry_price <= 0.001):
+                        logger.info(f"发现相同信号的活跃订单: {pair}")
+                        return True
+            
             return False
             
         except Exception as e:
@@ -991,154 +1268,220 @@ class BinanceTrader:
     def execute_trading_signals(self, signals: List[Dict]):
         """
         执行交易信号
-        
-        Args:
-            signals: 交易信号列表
         """
-        try:
-            for signal in signals:
-                try:
-                    # 检查信号是否已执行
-                    if self.is_signal_executed(signal):
-                        logger.info(f"跳过已执行的信号: {signal}")
-                        continue
-                    
-                    # 获取交易对信息
-                    symbol = signal.get('symbol')
-                    if not symbol:
-                        logger.error("交易信号缺少交易对信息")
-                        continue
-                    
-                    # 获取交易方向
-                    side = signal.get('side')
-                    if not side:
-                        logger.error(f"交易信号缺少方向信息: {signal}")
-                        continue
-                    
-                    # 获取入场价格
-                    entry_price = signal.get('entry_price')
-                    if not entry_price or entry_price <= 0:
-                        logger.error(f"交易信号缺少有效的入场价格: {signal}")
-                        continue
-                    
-                    # 获取止损价格
-                    stop_loss = signal.get('stop_loss')
-                    if not stop_loss or stop_loss <= 0:
-                        logger.error(f"交易信号缺少有效的止损价格: {signal}")
-                        continue
-                    
-                    # 获取止盈价格（可选）
-                    target_price = signal.get('target_price')
-                    
-                    # 获取当前市场价格
-                    current_price = self.get_current_price(symbol)
-                    if not current_price:
-                        logger.error(f"无法获取{symbol}当前价格")
-                        continue
-                    
-                    # 格式化价格
-                    entry_price = self.format_price(symbol, entry_price)
-                    stop_loss = self.format_price(symbol, stop_loss)
-                    if target_price:
-                        target_price = self.format_price(symbol, target_price)
-                    
-                    # 检查价格是否合适
-                    price_tolerance = 0.10  # 10%的价格容差
-                    
-                    if side == 'BUY':
-                        # 做多时，入场价不应该比当前价格高太多
-                        if entry_price >= current_price * (1 + price_tolerance):
-                            price_diff = ((entry_price/current_price)-1)*100
-                            logger.warning(f"做多入场价格 {entry_price} 比当前价格 {current_price} 高出 {price_diff:.2f}%")
-                            continue
-                    else:  # SELL
-                        # 做空时，入场价不应该比当前价格低太多
-                        if entry_price <= current_price * (1 - price_tolerance):
-                            price_diff = ((current_price/entry_price)-1)*100
-                            logger.warning(f"做空入场价格 {entry_price} 比当前价格 {current_price} 低出 {price_diff:.2f}%")
-                            continue
-                    
-                    # 检查余额是否足够
-                    if not self.check_balance_sufficient(symbol, 200):
-                        logger.error(f"余额不足，跳过交易信号: {symbol}")
-                        continue
-                    
-                    # 检查是否已有相同信号的挂单
-                    if self.check_existing_orders(symbol, side, entry_price):
-                        logger.info(f"已存在相同信号的挂单，跳过: {symbol} {side} @ {entry_price}")
-                        continue
-                    
-                    # 直接使用名义金额下单
-                    logger.info(f"准备下单: {symbol} {side} 名义金额: 200 USDT @ {entry_price}")
-                    logger.info(f"当前价格: {current_price}, 止损价格: {stop_loss}")
-                    
-                    # 下入场限价单（最多重试3次）
-                    max_retries = 3
-                    entry_order = None
-                    for retry in range(max_retries):
-                        try:
-                            entry_order = self.place_order(symbol, side, 'LIMIT', price=entry_price, notional=200)
-                            if entry_order:
-                                break
-                            time.sleep(1)  # 等待1秒后重试
-                        except Exception as e:
-                            logger.error(f"下入场单失败 (尝试 {retry+1}/{max_retries}): {e}")
-                            if retry < max_retries - 1:
-                                time.sleep(1)
-                                continue
-                    
-                    if not entry_order:
-                        logger.error(f"下入场单失败: {symbol} {side} @ {entry_price}")
-                        continue
-                    
-                    logger.info(f"下入场单成功: {symbol} {side} @ {entry_price}")
-                    
-                    # 下止损单（最多重试3次）
-                    stop_loss_side = 'SELL' if side == 'BUY' else 'BUY'
-                    stop_loss_order = None
-                    for retry in range(max_retries):
-                        try:
-                            stop_loss_order = self.place_order(symbol, stop_loss_side, 'STOP_MARKET', stop_price=stop_loss, notional=200)
-                            if stop_loss_order:
-                                break
-                            time.sleep(1)  # 等待1秒后重试
-                        except Exception as e:
-                            logger.error(f"下止损单失败 (尝试 {retry+1}/{max_retries}): {e}")
-                            if retry < max_retries - 1:
-                                time.sleep(1)
-                                continue
-                    
-                    if not stop_loss_order:
-                        logger.error(f"下止损单失败: {symbol} {stop_loss_side} @ {stop_loss}")
-                        continue
-                    
-                    logger.info(f"下止损单成功: {symbol} {stop_loss_side} @ {stop_loss}")
-                    
-                    # 标记信号为已执行（在入场单和止损单都成功后立即标记）
-                    self.mark_signal_executed(signal)
-                    logger.info(f"已标记信号为已执行: {self.get_signal_key(signal)}")
-                    
-                    # 如果有止盈价格，尝试下止盈单（但不影响信号标记）
-                    if target_price:
-                        try:
-                            take_profit_side = 'SELL' if side == 'BUY' else 'BUY'
-                            take_profit_order = self.place_order(symbol, take_profit_side, 'TAKE_PROFIT_MARKET', stop_price=target_price, notional=200)
-                            if not take_profit_order:
-                                logger.warning(f"下止盈单失败: {symbol} {take_profit_side} @ {target_price}")
-                            else:
-                                logger.info(f"下止盈单成功: {symbol} {take_profit_side} @ {target_price}")
-                        except Exception as e:
-                            logger.warning(f"下止盈单时出错（不影响交易）: {e}")
-                    
-                    # 等待订单执行
-                    time.sleep(1)
-                    
-                except Exception as e:
-                    logger.error(f"执行交易信号时出错: {e}")
+        if not signals:
+            logger.info("没有新的交易信号需要执行")
+            return
+            
+        logger.info(f"发现 {len(signals)} 个交易信号")
+        
+        for signal in signals:
+            try:
+                # 验证信号
+                if not self.validate_signal(signal):
+                    logger.warning(f"信号验证失败: {signal}")
                     continue
                     
+                # 获取信号参数
+                symbol = signal.get('symbol')
+                side = signal.get('side')
+                entry_price = signal.get('entry_price')
+                stop_loss = signal.get('stop_loss')
+                target_price = signal.get('target_price')
+                channel = signal.get('channel')
+                
+                # 打印所有参数值
+                logger.info(f"信号参数详情:")
+                logger.info(f"  symbol: {symbol}")
+                logger.info(f"  side: {side}")
+                logger.info(f"  entry_price: {entry_price}")
+                logger.info(f"  stop_loss: {stop_loss}")
+                logger.info(f"  target_price: {target_price}")
+                logger.info(f"  channel: {channel}")
+                
+                # 检查必要参数
+                if not all([symbol, side, entry_price]):
+                    logger.warning(f"信号参数不完整: symbol={symbol}, side={side}, entry_price={entry_price}")
+                    continue
+                
+                # 检查是否有止损或止盈
+                if not stop_loss and not target_price:
+                    logger.warning(f"信号缺少止损和止盈价格")
+                    continue
+                
+                # 生成信号标识
+                signal_key = self.get_signal_key(signal)
+                logger.info(f"生成信号标识: {signal_key}")
+                
+                # 检查是否已执行
+                if self.is_signal_executed(signal):
+                    logger.info(f"信号已执行，跳过: {symbol} {side}")
+                    continue
+                
+                # 检查是否有相同方向的未完成订单
+                if self.check_existing_orders(symbol, side, entry_price):
+                    logger.info(f"存在相同方向的未完成订单，跳过: {symbol} {side}")
+                    continue
+                
+                # 获取当前市场价格
+                current_price = self.get_current_price(symbol)
+                logger.info(f"当前市场价格: {current_price}")
+                
+                # 获取账户信息
+                account_info = self.get_account_info()
+                available_balance = float(account_info.get('availableBalance', 0))
+                logger.info(f"账户信息:\n  可用余额: {available_balance:.2f} USDT")
+                
+                # 计算开仓数量
+                if symbol == 'BTCUSDT':
+                    # BTC使用频道配置
+                    if not channel:
+                        logger.warning(f"BTC交易缺少频道信息: {signal}")
+                        continue
+                        
+                    # 获取BTC仓位大小
+                    position_size = self.get_btc_position_size(channel)
+                    if not position_size:
+                        logger.warning(f"无法获取BTC仓位大小，跳过")
+                        continue
+                        
+                    # 计算最大仓位价值
+                    max_position_value = self.get_btc_max_position_value(channel)
+                    if not max_position_value:
+                        logger.warning(f"无法获取BTC最大仓位价值，跳过")
+                        continue
+                        
+                    # 检查余额是否足够
+                    if not self.check_balance_sufficient(symbol, max_position_value):
+                        logger.warning(f"余额不足，跳过BTC交易")
+                        continue
+                        
+                    # 设置名义金额
+                    notional = max_position_value
+                    logger.info(f"使用最大仓位价值: {notional} USDT")
+                    logger.info(f"开仓所需保证金: {position_size} USDT")
+                else:
+                    # ETH和其他币种使用固定配置
+                    # 设置名义金额为1000U
+                    notional = 1000
+                    # 使用20倍杠杆
+                    leverage = 20
+                    # 计算实际开仓金额（保证金）
+                    actual_position = notional / leverage
+                    
+                    # 检查余额是否足够
+                    if not self.check_balance_sufficient(symbol, notional):
+                        logger.warning(f"余额不足，跳过{symbol}交易")
+                        continue
+                        
+                    logger.info(f"使用固定配置: 名义金额={notional}U, 实际开仓={actual_position}U, 杠杆={leverage}倍")
+                    logger.info(f"开仓所需保证金: {actual_position} USDT")
+                    
+                    # 执行开仓
+                    try:
+                        # 所有币种都使用限价单
+                        order = self.place_limit_order(symbol, side, notional=notional, price=entry_price)
+                        
+                        if order:
+                            logger.info(f"下入场单成功: {symbol} {side}")
+                            
+                            # 设置止损单（如果有止损价）
+                            if stop_loss:
+                                try:
+                                    stop_loss_order = self.place_stop_loss_order(symbol, side, notional=notional, stop_price=stop_loss)
+                                    if stop_loss_order:
+                                        logger.info(f"下止损单成功: {symbol} {side} @ {stop_loss}")
+                                except Exception as e:
+                                    logger.error(f"下止损单失败: {e}")
+                                    logger.error(f"下止损单失败: {symbol} {side} @ {stop_loss}")
+                            
+                            # 设置止盈单（如果有目标价）
+                            if target_price:
+                                try:
+                                    take_profit_order = self.place_take_profit_order(symbol, side, notional=notional, stop_price=target_price)
+                                    if take_profit_order:
+                                        logger.info(f"下止盈单成功: {symbol} {side} @ {target_price}")
+                                except Exception as e:
+                                    logger.error(f"下止盈单失败: {e}")
+                                    logger.error(f"下止盈单失败: {symbol} {side} @ {target_price}")
+                            
+                            # 标记信号为已执行
+                            self.mark_signal_executed(signal)
+                            logger.info(f"已保存 {len(self.executed_signals)} 条已执行订单记录")
+                            logger.info(f"标记信号为已执行: {signal_key}")
+                        else:
+                            logger.error(f"下入场单失败: {symbol} {side}")
+                            # 即使入场单失败，也标记信号为已执行
+                            self.mark_signal_executed(signal)
+                            logger.info(f"入场单失败，标记信号为已执行: {signal_key}")
+                            
+                    except Exception as e:
+                        logger.error(f"执行交易信号时出错: {e}, 信号: {signal}")
+                        # 即使发生异常，也标记信号为已执行
+                        self.mark_signal_executed(signal)
+                        logger.info(f"执行出错，标记信号为已执行: {signal_key}")
+                        continue
+                    
+            except Exception as e:
+                logger.error(f"处理交易信号时出错: {e}, 信号: {signal}")
+                continue
+
+    def check_order_status(self):
+        """
+        检查所有订单的状态，更新订单配对关系
+        """
+        try:
+            for entry_order_id, pair in list(self.order_pairs.items()):
+                if pair['status'] != 'active':
+                    continue
+                
+                try:
+                    # 检查入场单状态
+                    entry_order = self.get_order_status(pair['symbol'], int(entry_order_id))
+                    if not entry_order:
+                        continue
+                    
+                    # 如果入场单已成交
+                    if entry_order['status'] == 'FILLED':
+                        # 检查止损单状态
+                        if pair['stop_loss_order_id']:
+                            stop_loss_order = self.get_order_status(pair['symbol'], pair['stop_loss_order_id'])
+                            if stop_loss_order and stop_loss_order['status'] == 'FILLED':
+                                pair['status'] = 'closed_by_stop_loss'
+                                logger.info(f"订单 {entry_order_id} 已通过止损平仓")
+                        
+                        # 检查止盈单状态
+                        if pair['take_profit_order_id']:
+                            take_profit_order = self.get_order_status(pair['symbol'], pair['take_profit_order_id'])
+                            if take_profit_order and take_profit_order['status'] == 'FILLED':
+                                pair['status'] = 'closed_by_take_profit'
+                                logger.info(f"订单 {entry_order_id} 已通过止盈平仓")
+                    
+                    # 如果入场单已取消
+                    elif entry_order['status'] == 'CANCELED':
+                        # 取消对应的止损止盈单
+                        if pair['stop_loss_order_id']:
+                            try:
+                                self.cancel_order(pair['symbol'], pair['stop_loss_order_id'])
+                            except:
+                                pass
+                        if pair['take_profit_order_id']:
+                            try:
+                                self.cancel_order(pair['symbol'], pair['take_profit_order_id'])
+                            except:
+                                pass
+                        pair['status'] = 'canceled'
+                        logger.info(f"订单 {entry_order_id} 已取消")
+                    
+                except Exception as e:
+                    logger.error(f"检查订单 {entry_order_id} 状态时出错: {e}")
+                    continue
+            
+            # 保存更新后的订单配对关系
+            self.save_order_pairs()
+            
         except Exception as e:
-            logger.error(f"执行交易信号时出错: {e}")
+            logger.error(f"检查订单状态时出错: {e}")
 
     def monitor_and_trade(self, interval: int = 60):
         """
@@ -1149,7 +1492,6 @@ class BinanceTrader:
         """
         logger.info("开始监控交易信号...")
         last_cleanup_time = time.time()
-        processed_signals = set()  # 用于记录已处理的信号
         
         while True:
             try:
@@ -1159,23 +1501,28 @@ class BinanceTrader:
                 if current_time - last_cleanup_time >= 4 * 3600:  # 4小时
                     self.clean_expired_signals()
                     last_cleanup_time = current_time
-                    # 不再清空processed_signals，而是重新加载已执行信号
-                    processed_signals = set(self.executed_signals.keys())
-                    logger.info("已重新加载已执行信号记录")
+                    logger.info("已清理过期记录")
+                
+                # 检查订单状态
+                self.check_order_status()
                 
                 # 读取交易信号
                 signals = self.read_trading_signals()
                 if signals:
                     logger.info(f"发现 {len(signals)} 个交易信号")
-                    # 过滤掉已执行的信号和已处理的信号
+                    
+                    # 过滤掉已执行的信号
                     new_signals = []
                     for signal in signals:
                         try:
-                            signal_key = self.get_signal_key(signal)
+                            # 检查信号是否已执行
+                            if self.is_signal_executed(signal):
+                                logger.info(f"跳过已执行的信号: {self.get_signal_key(signal)}")
+                                continue
                             
-                            # 检查信号是否已执行或已处理
-                            if self.is_signal_executed(signal) or signal_key in processed_signals:
-                                logger.info(f"跳过已执行/已处理的信号: {signal_key}")
+                            # 检查是否有相同信号的挂单
+                            if self.check_existing_orders(signal['symbol'], signal['side'], signal['entry_price']):
+                                logger.info(f"已存在相同信号的挂单，跳过: {signal['symbol']} {signal['side']} @ {signal['entry_price']}")
                                 continue
                             
                             # 验证信号的有效性
@@ -1184,8 +1531,7 @@ class BinanceTrader:
                                 continue
                             
                             new_signals.append(signal)
-                            processed_signals.add(signal_key)
-                            logger.info(f"添加新信号到处理队列: {signal_key}")
+                            logger.info(f"添加新信号到处理队列: {self.get_signal_key(signal)}")
                             
                         except Exception as e:
                             logger.error(f"处理信号时出错: {e}")
@@ -1206,60 +1552,108 @@ class BinanceTrader:
 
     def validate_signal(self, signal: Dict) -> bool:
         """
-        验证交易信号的有效性
-        
-        Args:
-            signal: 交易信号字典
-            
-        Returns:
-            bool: 信号是否有效
+        验证交易信号
         """
         try:
             logger.info(f"开始验证信号: {signal}")
             
-            # 检查必要字段
-            required_fields = ['symbol', 'side', 'entry_price', 'stop_loss']
-            if not all(field in signal for field in required_fields):
-                logger.error(f"信号缺少必要字段: {signal}")
-                logger.error(f"缺少的字段: {[field for field in required_fields if field not in signal]}")
+            # 检查必要参数
+            required_fields = ['symbol', 'side', 'entry_price']
+            for field in required_fields:
+                if field not in signal or signal[field] is None:
+                    logger.warning(f"信号缺少必要字段: {field}")
+                    return False
+                    
+            symbol = signal['symbol']
+            side = signal['side']
+            entry_price = float(signal['entry_price'])
+            stop_loss = float(signal['stop_loss']) if signal.get('stop_loss') else None
+            target_price = float(signal['target_price']) if signal.get('target_price') else None
+            channel = signal.get('channel')
+            
+            # 检查是否有止损或止盈
+            if not stop_loss and not target_price:
+                logger.warning(f"信号缺少止损和止盈价格")
                 return False
             
-            # 检查价格是否为正数
-            if signal['entry_price'] <= 0 or signal['stop_loss'] <= 0:
-                logger.error(f"信号价格无效: {signal}")
-                logger.error(f"入场价格: {signal['entry_price']}, 止损价格: {signal['stop_loss']}")
-                return False
+            logger.info(f"信号参数解析:")
+            logger.info(f"  symbol: {symbol}")
+            logger.info(f"  side: {side}")
+            logger.info(f"  entry_price: {entry_price}")
+            logger.info(f"  stop_loss: {stop_loss}")
+            logger.info(f"  target_price: {target_price}")
+            logger.info(f"  channel: {channel}")
             
-            # 获取当前价格
-            current_price = self.get_current_price(signal['symbol'])
-            if not current_price:
-                logger.error(f"无法获取{signal['symbol']}当前价格")
-                return False
-            
+            # 获取当前市场价格
+            current_price = self.get_current_price(symbol)
             logger.info(f"当前市场价格: {current_price}")
             
-            # 检查价格关系
-            price_tolerance = 0.10  # 10%的价格容差
+            # 获取账户信息
+            account_info = self.get_account_info()
+            available_balance = float(account_info.get('availableBalance', 0))
+            logger.info(f"账户信息:\n  可用余额: {available_balance:.2f} USDT")
             
-            if signal['side'] == 'BUY':
-                # 做多时，入场价不应该比当前价格高太多
-                if signal['entry_price'] >= current_price * (1 + price_tolerance):
-                    price_diff = ((entry_price/current_price)-1)*100
-                    logger.warning(f"做多入场价格 {signal['entry_price']} 比当前价格 {current_price} 高出 {price_diff:.2f}%")
+            # 验证价格关系
+            if side == 'BUY':
+                if stop_loss and entry_price <= stop_loss:
+                    logger.warning(f"买入信号价格关系错误: 入场价({entry_price}) <= 止损价({stop_loss})")
+                    return False
+                if target_price and target_price <= entry_price:
+                    logger.warning(f"买入信号价格关系错误: 目标价({target_price}) <= 入场价({entry_price})")
                     return False
             else:  # SELL
-                # 做空时，入场价不应该比当前价格低太多
-                if signal['entry_price'] <= current_price * (1 - price_tolerance):
-                    price_diff = ((current_price/entry_price)-1)*100
-                    logger.warning(f"做空入场价格 {signal['entry_price']} 比当前价格 {current_price} 低出 {price_diff:.2f}%")
+                if stop_loss and entry_price >= stop_loss:
+                    logger.warning(f"卖出信号价格关系错误: 入场价({entry_price}) >= 止损价({stop_loss})")
+                    return False
+                if target_price and target_price >= entry_price:
+                    logger.warning(f"卖出信号价格关系错误: 目标价({target_price}) >= 入场价({entry_price})")
                     return False
             
-            # 检查余额是否足够
-            if not self.check_balance_sufficient(signal['symbol'], 200):
-                logger.error(f"余额不足，无法执行信号: {signal['symbol']}")
+            # 检查交易对是否支持
+            if not self.is_symbol_supported(symbol):
+                logger.warning(f"不支持的交易对: {symbol}")
                 return False
             
-            logger.info(f"信号验证通过: {signal}")
+            # 检查余额是否足够
+            if symbol == 'BTCUSDT':
+                # BTC使用频道配置
+                if not channel:
+                    logger.warning(f"BTC交易缺少频道信息")
+                    return False
+                    
+                # 获取BTC仓位大小
+                position_size = self.get_btc_position_size(channel)
+                if not position_size:
+                    logger.warning(f"无法获取BTC仓位大小")
+                    return False
+                    
+                # 计算最大仓位价值
+                max_position_value = self.get_btc_max_position_value(channel)
+                if not max_position_value:
+                    logger.warning(f"无法获取BTC最大仓位价值")
+                    return False
+                    
+                # 检查余额是否足够
+                if not self.check_balance_sufficient(symbol, max_position_value):
+                    logger.warning(f"余额不足，需要 {max_position_value} USDT")
+                    return False
+            else:
+                # ETH和其他币种使用固定配置
+                # 设置名义金额为1000U
+                notional = 1000
+                # 使用20倍杠杆
+                leverage = 20
+                # 计算实际开仓金额（保证金）
+                actual_position = notional / leverage
+                
+                # 检查余额是否足够
+                if not self.check_balance_sufficient(symbol, notional):
+                    logger.warning(f"余额不足，需要 {notional} USDT")
+                    return False
+                    
+                logger.info(f"使用固定配置: 名义金额={notional}U, 实际开仓={actual_position}U, 杠杆={leverage}倍")
+            
+            logger.info(f"信号验证通过: {symbol} {side}")
             return True
             
         except Exception as e:
@@ -1268,34 +1662,26 @@ class BinanceTrader:
 
     def get_cross_margin_account(self) -> Dict:
         """
-        获取全仓账户详情
-        
-        Returns:
-            Dict: 全仓账户信息
+        获取全仓账户信息
         """
         try:
-            account = self._request(self.client.get_margin_account)
+            response = self._request('GET', '/sapi/v1/margin/account')
+            if not response:
+                return {}
+                
+            # 只记录总资产信息
+            total_net_asset = float(response.get('totalNetAssetOfBtc', 0))
+            total_asset = float(response.get('totalAssetOfBtc', 0))
+            total_liability = float(response.get('totalLiabilityOfBtc', 0))
             
-            logger.info("全仓账户信息:")
-            logger.info(f"账户类型: {account.get('accountType', 'N/A')}")
-            logger.info(f"保证金水平: {account.get('marginLevel', 'N/A')}")
-            logger.info(f"总资产: {account.get('totalCollateralValueInUSDT', 'N/A')} USDT")
-            logger.info(f"总负债: {account.get('totalLiabilityOfBtc', 'N/A')} BTC")
-            logger.info(f"净资产: {account.get('totalNetAssetOfBtc', 'N/A')} BTC")
+            logger.info(f"全仓账户总资产: {total_asset:.8f} BTC")
+            logger.info(f"全仓账户总负债: {total_liability:.8f} BTC")
+            logger.info(f"全仓账户净资产: {total_net_asset:.8f} BTC")
             
-            # 打印各个币种的资产信息
-            logger.info("\n各币种资产详情:")
-            for asset in account.get('userAssets', []):
-                logger.info(f"{asset['asset']}:")
-                logger.info(f"  可用: {asset['free']}")
-                logger.info(f"  已借: {asset['borrowed']}")
-                logger.info(f"  利息: {asset['interest']}")
-                logger.info(f"  锁定: {asset['locked']}")
-                logger.info(f"  净资产: {asset['netAsset']}")
+            return response
             
-            return account
-        except BinanceAPIException as e:
-            logger.error(f"获取全仓账户信息失败: {e}")
+        except Exception as e:
+            logger.error(f"获取全仓账户信息时出错: {e}")
             return {}
 
     def get_position_info(self) -> Dict:
@@ -1372,11 +1758,8 @@ class BinanceTrader:
         """
         try:
             # 获取所有合约交易对信息
-            logger.info("开始获取合约交易对信息...")
             exchange_info = self._request(self.client.futures_exchange_info)
             supported_symbols = {}
-            
-            logger.info(f"获取到 {len(exchange_info['symbols'])} 个交易对")
             
             # 处理从API获取的交易对
             for symbol_info in exchange_info['symbols']:
@@ -1390,8 +1773,6 @@ class BinanceTrader:
                         symbol = 'BTCUSDT'
                     elif base_asset == 'ETH':
                         symbol = 'ETHUSDT'
-                    
-                    logger.info(f"处理交易对: {symbol} (基础资产: {base_asset})")
                     
                     # 获取数量精度
                     quantity_precision = 0
@@ -1425,25 +1806,17 @@ class BinanceTrader:
                         'min_qty': min_qty,
                         'min_notional': min_notional
                     }
-                    logger.info(f"添加交易对 {symbol} 到支持列表")
-            
-            logger.info(f"已加载 {len(supported_symbols)} 个USDT合约交易对")
-            logger.info(f"支持的交易对列表: {list(supported_symbols.keys())}")
-            
-            # 打印所有支持的交易对详细信息
-            for base_asset, info in supported_symbols.items():
-                logger.info(f"交易对 {base_asset}: {info}")
             
             # 确保全局变量被更新
             global SUPPORTED_SYMBOLS
             SUPPORTED_SYMBOLS = supported_symbols
             
+            logger.info(f"已加载 {len(supported_symbols)} 个USDT合约交易对")
             return supported_symbols
             
         except Exception as e:
             logger.error(f"获取支持的交易对信息失败: {e}")
             # 如果API调用失败，返回空字典
-            logger.info("API调用失败，返回空字典")
             return {}
 
     def _request(self, method, *args, **kwargs):
@@ -1498,7 +1871,29 @@ class BinanceTrader:
             
             # 找出过期的记录
             for signal_key, execution_time in self.executed_signals.items():
+                # 检查是否超过4小时
                 if current_time - execution_time >= 4 * 3600:  # 4小时 = 4 * 3600秒
+                    # 检查信号是否已经完成（通过订单配对关系）
+                    signal_parts = signal_key.split('_')
+                    if len(signal_parts) >= 4:
+                        symbol = signal_parts[0]
+                        side = signal_parts[1]
+                        entry_price = float(signal_parts[2])
+                        
+                        # 检查是否有对应的已完成订单
+                        has_completed_order = False
+                        for pair in self.order_pairs.values():
+                            if (pair['symbol'] == symbol and 
+                                pair['side'] == side and 
+                                abs(float(pair['entry_price']) - entry_price) / entry_price <= 0.001):
+                                if pair['status'] in ['closed_by_stop_loss', 'closed_by_take_profit']:
+                                    has_completed_order = True
+                                    break
+                        
+                        # 如果没有已完成订单，则保留记录
+                        if not has_completed_order:
+                            continue
+                    
                     expired_keys.append(signal_key)
             
             # 删除过期记录
@@ -1513,6 +1908,231 @@ class BinanceTrader:
         except Exception as e:
             logger.error(f"清理过期记录时出错: {e}")
 
+    def load_btc_position_config(self) -> Dict:
+        """
+        加载BTC仓位配置文件（Excel格式）
+        """
+        try:
+            config_path = os.path.join('C:\\', 'Users', 'Administrator', 'Desktop', 'btc仓位.xlsx')
+            if not os.path.exists(config_path):
+                logger.warning(f"BTC仓位配置文件不存在: {config_path}")
+                return {}
+                
+            # 读取Excel文件
+            try:
+                df = pd.read_excel(config_path)
+                logger.info(f"成功读取BTC仓位配置文件: {config_path}")
+                logger.info(f"Excel文件列名: {df.columns.tolist()}")
+                
+                # 检查必要的列是否存在
+                required_columns = ['频道', '比例']  # 可能的列名
+                found_columns = []
+                
+                for col in df.columns:
+                    if '频道' in col:
+                        channel_col = col
+                        found_columns.append(col)
+                    elif '比例' in col:
+                        ratio_col = col
+                        found_columns.append(col)
+                        
+                if len(found_columns) < 2:
+                    logger.error(f"Excel文件缺少必要的列，当前列名: {df.columns.tolist()}")
+                    return {}
+                    
+                logger.info(f"使用列名: 频道={channel_col}, 比例={ratio_col}")
+                
+                # 将DataFrame转换为字典格式
+                config = {}
+                for _, row in df.iterrows():
+                    channel = str(row[channel_col]).strip()
+                    ratio = float(row[ratio_col])
+                    if channel and not pd.isna(ratio):
+                        config[channel] = {'ratio': ratio}
+                        
+                logger.info(f"已加载BTC仓位配置: {config}")
+                return config
+                
+            except Exception as e:
+                logger.error(f"读取Excel文件时出错: {str(e)}")
+                return {}
+                
+        except Exception as e:
+            logger.error(f"加载BTC仓位配置时出错: {str(e)}")
+            return {}
+
+    def get_btc_position_size(self, channel: str) -> Optional[float]:
+        """
+        获取BTC仓位大小
+        
+        Args:
+            channel: 频道名称
+            
+        Returns:
+            float: 仓位大小（USDT）
+        """
+        try:
+            # 获取频道配置
+            channel_config = self.btc_channel_positions.get(channel)
+            if not channel_config:
+                logger.warning(f"未找到频道配置: {channel}")
+                return None
+                
+            # 获取仓位比例
+            position_ratio = float(channel_config.get('ratio', 0))
+            if position_ratio <= 0:
+                logger.warning(f"无效的仓位比例: {position_ratio}")
+                return None
+                
+            # 计算仓位大小
+            position_size = self.btc_initial_capital * position_ratio
+            logger.info(f"频道 {channel} 仓位大小: {position_size} USDT")
+            return position_size
+            
+        except Exception as e:
+            logger.error(f"获取BTC仓位大小失败: {e}")
+            return None
+            
+    def get_btc_max_position_value(self, channel: str) -> Optional[float]:
+        """
+        获取BTC最大仓位价值
+        
+        Args:
+            channel: 频道名称
+            
+        Returns:
+            float: 最大仓位价值（USDT）
+        """
+        try:
+            # 获取仓位大小
+            position_size = self.get_btc_position_size(channel)
+            if not position_size:
+                return None
+                
+            # 计算最大仓位价值
+            max_position_value = position_size * self.btc_leverage
+            logger.info(f"频道 {channel} 最大仓位价值: {max_position_value} USDT")
+            return max_position_value
+            
+        except Exception as e:
+            logger.error(f"获取BTC最大仓位价值失败: {e}")
+            return None
+
+    def update_btc_position_config(self, new_config: Dict) -> bool:
+        """
+        更新BTC仓位配置
+        
+        Args:
+            new_config: 新的仓位配置
+            
+        Returns:
+            bool: 是否更新成功
+        """
+        try:
+            # 验证配置总和是否为1
+            total_ratio = sum(new_config.values())
+            if abs(total_ratio - 1.0) > 0.0001:  # 允许0.01%的误差
+                logger.error(f"BTC仓位配置总和必须为1，当前总和: {total_ratio}")
+                return False
+                
+            # 更新配置
+            self.btc_channel_positions = new_config
+            self.save_btc_position_config(new_config)
+            logger.info(f"已更新BTC仓位配置: {new_config}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"更新BTC仓位配置失败: {e}")
+            return False
+
+    def get_all_btc_channel_positions(self) -> Dict:
+        """
+        获取所有频道的BTC仓位信息
+        
+        Returns:
+            Dict: 所有频道的BTC仓位信息
+        """
+        positions = {}
+        for channel in self.btc_channel_positions:
+            position_size = self.get_btc_position_size(channel)
+            max_value = self.get_btc_max_position_value(channel)
+            positions[channel] = {
+                'position_size': position_size,
+                'max_position_value': max_value,
+                'ratio': self.btc_channel_positions[channel]
+            }
+        return positions
+
+    def load_order_pairs(self) -> Dict:
+        """
+        加载订单配对关系
+        
+        Returns:
+            Dict: 订单配对关系字典
+        """
+        try:
+            if os.path.exists(self.order_pairs_file):
+                with open(self.order_pairs_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    logger.info(f"已加载 {len(data)} 条订单配对关系")
+                    return data
+            return {}
+        except Exception as e:
+            logger.error(f"加载订单配对关系失败: {e}")
+            return {}
+
+    def save_order_pairs(self):
+        """
+        保存订单配对关系到文件
+        """
+        try:
+            # 确保目录存在
+            os.makedirs(os.path.dirname(self.order_pairs_file), exist_ok=True)
+            
+            # 保存记录
+            with open(self.order_pairs_file, 'w', encoding='utf-8') as f:
+                json.dump(self.order_pairs, f, ensure_ascii=False, indent=2)
+            logger.info(f"已保存 {len(self.order_pairs)} 条订单配对关系")
+        except Exception as e:
+            logger.error(f"保存订单配对关系失败: {e}")
+
+    def is_symbol_supported(self, symbol: str) -> bool:
+        """
+        检查交易对是否支持
+        
+        Args:
+            symbol: 交易对名称
+            
+        Returns:
+            bool: 是否支持该交易对
+        """
+        try:
+            # 标准化交易对名称
+            if not symbol:
+                return False
+                
+            # 移除可能的后缀（如USDT）
+            base_symbol = str(symbol).strip().upper().replace('USDT', '')
+            
+            # 检查是否在支持的交易对中
+            if base_symbol in SUPPORTED_SYMBOLS:
+                return True
+                
+            # 检查是否是BTC
+            if 'BTC' in base_symbol or base_symbol == 'BTC':
+                return True
+                
+            # 检查是否是ETH
+            if 'ETH' in base_symbol or base_symbol == 'ETH':
+                return True
+                
+            logger.warning(f"不支持的交易对: {symbol}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"检查交易对支持时出错: {e}")
+            return False
+
 def main():
     try:
         # 创建交易实例
@@ -1524,19 +2144,12 @@ def main():
         # 获取当前持仓信息
         position_info = trader.get_position_info()
         
-        # 获取当前价格
-        print("\n当前价格:")
-        for key, value in SUPPORTED_SYMBOLS.items():
-            price = trader.get_current_price(value['symbol'])
-            if price:
-                print(f"{value['symbol']}: {price}")
-        
         # 显示交易配置
         print("\n当前交易配置:")
         print(json.dumps(trader.trading_config, indent=2))
         
-        # 开始监控交易
-        trader.monitor_and_trade()
+        # 开始监控交易，每30秒检查一次
+        trader.monitor_and_trade(interval=30)
         
     except Exception as e:
         logger.error(f"程序运行出错: {e}")

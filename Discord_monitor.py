@@ -18,11 +18,20 @@ import requests
 import hmac
 import base64
 import hashlib
+from Log import log_manager
 
-# 设置日志 - 移到最前面
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(levelname)s - %(message)s')
+# 获取日志记录器
 logger = logging.getLogger(__name__)
+
+# 设置日志级别
+logger.setLevel(logging.WARNING)
+
+# 移除所有现有的处理器
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+# 添加处理器
+logger.addHandler(logging.StreamHandler())
 
 # 在导入discord之前，创建并注入所有需要的假模块
 class DummyAudioop:
@@ -263,54 +272,6 @@ def patch_discord():
 patch_discord()
 
 class SimpleDiscordMonitor(discord.Client):
-    async def setup_http_session(self):
-        """设置HTTP会话"""
-        try:
-            # 创建TCP连接器
-            connector = aiohttp.TCPConnector(
-                ssl=False,
-                force_close=True,
-                enable_cleanup_closed=True,
-                ttl_dns_cache=300,
-                limit=10
-            )
-            
-            # 设置超时
-            timeout = aiohttp.ClientTimeout(
-                total=60,
-                connect=30,
-                sock_connect=30,
-                sock_read=30
-            )
-            
-            # 创建会话
-            session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'application/json'
-                }
-            )
-            
-            return session
-            
-        except Exception as e:
-            logger.error(f"设置HTTP会话时发生错误: {str(e)}")
-            # 在出错时创建一个基本的会话作为后备
-            try:
-                logger.info("尝试创建后备HTTP会话...")
-                backup_connector = aiohttp.TCPConnector(ssl=False, force_close=True)
-                backup_session = aiohttp.ClientSession(
-                    connector=backup_connector,
-                    headers={'User-Agent': 'Mozilla/5.0'}
-                )
-                logger.info("成功创建后备HTTP会话")
-                return backup_session
-            except Exception as backup_error:
-                logger.error(f"创建后备HTTP会话也失败: {str(backup_error)}")
-                raise
-
     def __init__(self, config):
         # 保存配置
         self.config = config
@@ -319,13 +280,19 @@ class SimpleDiscordMonitor(discord.Client):
         super().__init__(
             self_bot=True,  # 必须设置为 True，表示这是一个用户账号
             chunk_guilds_at_startup=False,  # 不需要加载所有成员
-            max_messages=10000  # 消息缓存上限
+            max_messages=10000,  # 消息缓存上限
+            heartbeat_timeout=60.0,  # 增加心跳超时时间
+            guild_ready_timeout=10.0,  # 增加服务器就绪超时时间
+            connect_timeout=60.0  # 增加连接超时时间
         )
         
         # 初始化其他组件
         self.message_processor = MessageProcessor(config)
         self.messages = {}
         self.last_save_time = {}
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+        self.reconnect_delay = 1.0
         
         # 设置保存目录
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -351,16 +318,37 @@ class SimpleDiscordMonitor(discord.Client):
             channel_file = os.path.join(self.save_dir, filename)
             try:
                 if os.path.exists(channel_file):
-                    with open(channel_file, 'r', encoding='utf-8') as f:
-                        self.messages[channel_id] = json.load(f)
-                    logger.info(f"已加载频道 {channel_name} ({channel_id}) 的消息文件")
+                    # 检查文件是否为空
+                    if os.path.getsize(channel_file) == 0:
+                        logger.warning(f"频道 {channel_name} ({channel_id}) 的消息文件为空，创建新的空数组")
+                        self.messages[channel_id] = []
+                        with open(channel_file, 'w', encoding='utf-8') as f:
+                            json.dump([], f, ensure_ascii=False, indent=2)
+                    else:
+                        try:
+                            with open(channel_file, 'r', encoding='utf-8') as f:
+                                content = f.read().strip()
+                                if not content:  # 如果文件只包含空白字符
+                                    self.messages[channel_id] = []
+                                    with open(channel_file, 'w', encoding='utf-8') as f:
+                                        json.dump([], f, ensure_ascii=False, indent=2)
+                                else:
+                                    self.messages[channel_id] = json.loads(content)
+                            logger.info(f"已加载频道 {channel_name} ({channel_id}) 的消息文件")
+                        except json.JSONDecodeError:
+                            logger.warning(f"频道 {channel_name} ({channel_id}) 的消息文件格式错误，重置为空数组")
+                            self.messages[channel_id] = []
+                            with open(channel_file, 'w', encoding='utf-8') as f:
+                                json.dump([], f, ensure_ascii=False, indent=2)
                 else:
+                    # 创建新文件
                     self.messages[channel_id] = []
                     with open(channel_file, 'w', encoding='utf-8') as f:
                         json.dump([], f, ensure_ascii=False, indent=2)
                     logger.info(f"已创建频道 {channel_name} ({channel_id}) 的消息文件")
             except Exception as e:
                 logger.error(f"处理频道 {channel_name} ({channel_id}) 的消息文件时出错: {str(e)}")
+                # 确保即使出错也初始化消息列表
                 self.messages[channel_id] = []
 
     def is_monitored_channel(self, message):
@@ -394,19 +382,58 @@ class SimpleDiscordMonitor(discord.Client):
             logger.error(f"保存频道 {channel_id} 的消息时出错: {str(e)}")
             logger.exception(e)
 
-    async def setup_hook(self) -> None:
-        """设置钩子，在客户端准备好之前调用"""
+    async def setup_http_session(self):
+        """设置HTTP会话"""
         try:
-            logger.info("setup_hook 被调用")
-            session = await self.setup_http_session()
-            self.http.session = session
-            logger.info("setup_hook 完成")
+            # 创建TCP连接器
+            connector = aiohttp.TCPConnector(
+                ssl=False,
+                force_close=True,
+                enable_cleanup_closed=True,
+                ttl_dns_cache=300,
+                limit=10,
+                keepalive_timeout=60.0  # 增加keepalive超时时间
+            )
             
-            # 在这里也添加一个测试日志
-            logger.info("等待 on_ready 事件...")
+            # 设置超时
+            timeout = aiohttp.ClientTimeout(
+                total=120,  # 增加总超时时间
+                connect=60,  # 增加连接超时时间
+                sock_connect=60,  # 增加socket连接超时时间
+                sock_read=60  # 增加socket读取超时时间
+            )
+            
+            # 创建会话
+            session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
+                }
+            )
+            
+            return session
+            
         except Exception as e:
-            logger.error(f"设置钩子时发生错误: {str(e)}")
-            raise
+            logger.error(f"设置HTTP会话时发生错误: {str(e)}")
+            # 在出错时创建一个基本的会话作为后备
+            try:
+                logger.info("尝试创建后备HTTP会话...")
+                backup_connector = aiohttp.TCPConnector(
+                    ssl=False,
+                    force_close=True,
+                    keepalive_timeout=60.0
+                )
+                backup_session = aiohttp.ClientSession(
+                    connector=backup_connector,
+                    headers={'User-Agent': 'Mozilla/5.0'}
+                )
+                logger.info("成功创建后备HTTP会话")
+                return backup_session
+            except Exception as backup_error:
+                logger.error(f"创建后备HTTP会话也失败: {str(backup_error)}")
+                raise
 
     async def on_connect(self):
         """当客户端连接到Discord时触发"""
@@ -414,17 +441,42 @@ class SimpleDiscordMonitor(discord.Client):
 
     async def on_disconnect(self):
         """当客户端断开连接时触发"""
-        logger.warning("与Discord服务器的连接已断开，尝试重新连接...")
+        logger.warning("与Discord服务器的连接已断开")
+        
+        if self.reconnect_attempts < self.max_reconnect_attempts:
+            self.reconnect_attempts += 1
+            delay = self.reconnect_delay * (2 ** (self.reconnect_attempts - 1))  # 指数退避
+            logger.info(f"尝试重新连接... (第 {self.reconnect_attempts} 次尝试，等待 {delay} 秒)")
+            await asyncio.sleep(delay)
+            await self.connect(reconnect=True)
+        else:
+            logger.error(f"达到最大重连次数 ({self.max_reconnect_attempts})，停止重连")
+            await self.close()
 
     async def on_error(self, event, *args, **kwargs):
         """当发生错误时触发"""
         logger.error(f"发生错误 - 事件: {event}")
         import traceback
         logger.error(traceback.format_exc())
+        
+        # 如果是WebSocket相关错误，尝试重新连接
+        if "WebSocket" in str(args) or "Connection" in str(args):
+            if self.reconnect_attempts < self.max_reconnect_attempts:
+                self.reconnect_attempts += 1
+                delay = self.reconnect_delay * (2 ** (self.reconnect_attempts - 1))
+                logger.info(f"WebSocket错误，尝试重新连接... (第 {self.reconnect_attempts} 次尝试，等待 {delay} 秒)")
+                await asyncio.sleep(delay)
+                await self.connect(reconnect=True)
+            else:
+                logger.error(f"达到最大重连次数 ({self.max_reconnect_attempts})，停止重连")
+                await self.close()
 
     async def on_ready(self):
         """当机器人成功登录后触发"""
         try:
+            # 重置重连计数
+            self.reconnect_attempts = 0
+            
             logger.info("\n" + "=" * 50)
             logger.info("Discord Monitor 已就绪")
             logger.info(f"登录账号: {self.user.name}")

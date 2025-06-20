@@ -24,74 +24,25 @@ import tempfile
 from io import StringIO
 import numpy as np
 import glob
+from Log import log_manager
+
+# 获取日志记录器
+logger = logging.getLogger(__name__)
+
+# 设置日志级别
+logger.setLevel(logging.WARNING)
+
+# 移除所有现有的处理器
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+# 添加处理器
+logger.addHandler(logging.StreamHandler())
 
 # 配置日志系统
 def setup_logging():
     """配置日志系统"""
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # 清理旧日志文件，防止磁盘空间不足
-    try:
-        # 保留最近7天的日志
-        log_files = [f for f in os.listdir(log_dir) if f.endswith('.log')]
-        if len(log_files) > 10:  # 如果日志文件超过10个
-            log_files.sort()  # 按文件名排序（通常包含日期）
-            for old_file in log_files[:-7]:  # 删除最旧的，只保留最新的7个
-                try:
-                    os.remove(os.path.join(log_dir, old_file))
-                    print(f"已删除旧日志文件: {old_file}")
-                except Exception as e:
-                    print(f"删除日志文件失败: {e}")
-    except Exception as e:
-        print(f"清理日志文件时出错: {e}")
-    
-    # 检查磁盘空间
-    try:
-        import shutil
-        total, used, free = shutil.disk_usage("/")
-        free_gb = free / (1024**3)
-        if free_gb < 1.0:  # 如果剩余空间小于1GB
-            print(f"警告: 磁盘空间不足! 剩余: {free_gb:.2f}GB")
-            # 创建紧急备用日志目录在内存中（使用临时目录）
-            log_dir = tempfile.gettempdir()
-            print(f"切换到临时日志目录: {log_dir}")
-    except Exception as e:
-        print(f"检查磁盘空间时出错: {e}")
-    
-    # 创建安全的日志处理器工厂
-    def create_file_handler():
-        try:
-            return logging.FileHandler(
-                os.path.join(log_dir, f"trading_messages_{datetime.now().strftime('%Y%m%d')}.log"), 
-                encoding='utf-8'
-            )
-        except Exception as e:
-            print(f"创建文件日志处理器失败: {e}")
-            # 返回一个内存中的StringIO日志处理器
-            class StringIOHandler(logging.StreamHandler):
-                def __init__(self):
-                    self.strio = StringIO()
-                    super().__init__(self.strio)
-                def flush(self):
-                    pass  # 防止内存字符串IO发生异常
-            return StringIOHandler()
-    
-    # 创建日志格式
-    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    
-    # 配置根日志记录器
-    logging.basicConfig(
-        level=logging.INFO,
-        format=log_format,
-        handlers=[
-            create_file_handler(),
-            logging.StreamHandler()
-        ]
-    )
-    
-    # 获取当前模块的日志记录器
-    logger = logging.getLogger(__name__)
+    # 使用全局日志管理器
     return logger
 
 # 初始化日志记录器
@@ -141,6 +92,9 @@ class MessageFileHandler(FileSystemEventHandler):
         self._load_processed_ids()
         logger.info("消息处理器已初始化")
         
+        self.last_health_check = time.time()
+        self.health_check_interval = 300  # 5分钟执行一次健康检查
+        
     def _load_processed_ids(self):
         """从文件加载已处理的消息ID"""
         try:
@@ -169,6 +123,17 @@ class MessageFileHandler(FileSystemEventHandler):
             self._safe_process_file(event.src_path, "created")
             
     def on_modified(self, event):
+        if event.is_directory:
+            return
+            
+        current_time = time.time()
+        
+        # 健康检查
+        if current_time - self.last_health_check >= self.health_check_interval:
+            self._perform_health_check()
+            self.last_health_check = current_time
+            
+        # 处理文件修改
         if not event.is_directory and event.src_path.endswith('.json'):
             logger.info(f"检测到文件修改: {event.src_path}")
             self._safe_process_file(event.src_path, "modified")
@@ -199,11 +164,11 @@ class MessageFileHandler(FileSystemEventHandler):
         except Exception as e:
             logger.error(f"检查磁盘空间时出错: {str(e)}")
 
-        # 检查是否最近处理过（5秒内）
+        # 检查是否最近处理过（30秒内）
         current_time = time.time()
         if file_path in self.last_processed_time:
             time_diff = current_time - self.last_processed_time[file_path]
-            if time_diff < 5:  # 5秒内的重复处理会被忽略
+            if time_diff < 30:  # 增加到30秒，避免频繁处理
                 logger.info(f"文件 {file_path} 在 {time_diff:.2f} 秒前刚处理过，跳过此次 {event_type} 事件")
                 return
         
@@ -213,36 +178,28 @@ class MessageFileHandler(FileSystemEventHandler):
             return
             
         try:
-            # 记录当前处理的文件
-            self.current_processing_file = file_path
-            
-            # 确保文件写入完成
-            time.sleep(2)  # 增加等待时间，确保文件完全写入
-            
-            # 记录最后处理时间
+            # 更新最后处理时间
             self.last_processed_time[file_path] = current_time
             
             # 处理文件
             self.process_file(file_path)
             
-        except OSError as ose:
-            if "No space left on device" in str(ose):
-                logger.critical("磁盘空间已用尽! 尝试紧急清理...")
-                self._cleanup_old_logs(emergency=True)
-                self._cleanup_old_analysis_files(emergency=True)
-                logger.warning("紧急清理完成，请检查磁盘空间")
-            else:
-                logger.error(f"处理文件时发生OS错误: {str(ose)}")
-                traceback.print_exc()
         except Exception as e:
-            logger.error(f"处理文件时发生未捕获异常: {str(e)}")
+            logger.error(f"处理文件时出错 {file_path}: {str(e)}")
             traceback.print_exc()
         finally:
-            self.current_processing_file = None
-            try:
+            # 确保在处理完成后释放锁
+            if self.processing_lock.locked():
                 self.processing_lock.release()
-            except RuntimeError:
-                logger.warning("尝试释放未锁定的锁，这可能是由于并发问题导致的")
+            # 清理过期的处理时间记录（保留最近1小时的记录）
+            self._cleanup_old_processed_times()
+    
+    def _cleanup_old_processed_times(self):
+        """清理过期的文件处理时间记录"""
+        current_time = time.time()
+        expired_time = current_time - 3600  # 1小时前的记录
+        self.last_processed_time = {k: v for k, v in self.last_processed_time.items() 
+                                  if v > expired_time}
     
     def _cleanup_old_logs(self, emergency=False):
         """清理旧日志文件"""
@@ -2842,9 +2799,9 @@ class HistoricalMessageAnalyzer:
         """获取当前进程的内存使用情况（MB）"""
         try:
             import psutil
-            process = psutil.Process(os.getpid())
+            process = psutil.Process()
             memory_info = process.memory_info()
-            return memory_info.rss / 1024 / 1024  # 转换为MB
+            return memory_info.rss / (1024 * 1024)  # 转换为MB
         except ImportError:
             return 0  # 如果psutil不可用
         except Exception as e:
@@ -3506,12 +3463,17 @@ def validate_data_before_save(value):
     验证并处理数据，确保它可以被安全地保存到CSV/Excel文件中
     """
     try:
-        # 处理列表或数组
-        if isinstance(value, (list, np.ndarray)):
-            # 如果是空列表或空数组，返回None
+        # 处理numpy array
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return None
+            if value.ndim == 0:  # 处理标量数组
+                return value.item()
+            value = value.tolist()
+        # 处理列表
+        if isinstance(value, list):
             if len(value) == 0:
                 return None
-                
             # 提取第一个非空值
             for item in value:
                 if item is not None and str(item).strip() != '':
@@ -3520,47 +3482,44 @@ def validate_data_before_save(value):
                         return validate_data_before_save(item)
                     return item
             return None
-            
         # 处理字典
         elif isinstance(value, dict):
             # 将字典转换为JSON字符串
             return json.dumps(value, ensure_ascii=False)
-            
         # 对字符串进行处理
         elif isinstance(value, str):
             # 如果字符串为空或只包含空格，返回None
             if value.strip() == '':
                 return None
             return value
-            
         # 对数值类型的处理
         elif isinstance(value, (int, float)):
             # 检查是否为NaN或无穷大
-            if np.isnan(value) or np.isinf(value):
+            if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
                 return None
             return value
-            
         # 对布尔值的处理
         elif isinstance(value, bool):
             return value
-            
         # 处理None和NaN
         elif value is None or (isinstance(value, float) and np.isnan(value)):
             return None
-            
-        # 处理NumPy数组
+        # 处理其他NumPy类型
         elif hasattr(value, 'size') and hasattr(value, 'tolist'):
             if value.size == 0:
                 return None
+            if hasattr(value, 'item'):  # 处理标量类型
+                return value.item()
             return validate_data_before_save(value.tolist())
-            
+        # 处理空数组
+        elif hasattr(value, '__len__') and len(value) == 0:
+            return None
         # 其他类型，尝试转换为字符串
         else:
             try:
                 return str(value)
             except:
                 return None
-                
     except Exception as e:
         logger.warning(f"数据验证失败: {str(e)}, 值类型: {type(value)}")
         return None

@@ -6,23 +6,36 @@ import numpy as np
 import os
 from datetime import datetime
 from flask import Flask, render_template, jsonify, request, send_from_directory
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 from Binance_price_monitor import BinanceRestPriceMonitor
 import threading
 import requests
-
-# 首先禁用所有日志
 import logging
-logging.getLogger('werkzeug').setLevel(logging.ERROR)
-logging.getLogger('socketio').setLevel(logging.ERROR)
-logging.getLogger('engineio').setLevel(logging.ERROR)
-logging.getLogger('geventwebsocket').setLevel(logging.ERROR)
+from pathlib import Path
+from Log import log_manager
+
+# 获取日志记录器
+logger = logging.getLogger(__name__)
+
+# 设置日志级别
+logger.setLevel(logging.WARNING)
+
+# 移除所有现有的处理器
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+# 添加处理器
+logger.addHandler(logging.StreamHandler())
+
+# 设置所有相关日志记录器的级别为WARNING
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('flask').setLevel(logging.WARNING)
+logging.getLogger('socketio').setLevel(logging.WARNING)
+logging.getLogger('engineio').setLevel(logging.WARNING)
 
 # 初始化应用
 app = Flask(__name__, static_url_path='', static_folder='static')
-# 修改CORS设置
 app.config['SECRET_KEY'] = 'secret!'
-# 禁用所有日志
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', logger=False, engineio_logger=False)
 
 # 创建价格监控器
@@ -32,7 +45,10 @@ start_time = None
 last_csv_check_time = 0  # 上次检查CSV文件的时间
 csv_check_interval = 5  # 每5秒检查一次CSV文件
 last_csv_modification_time = 0  # 上次CSV文件修改时间
-csv_file_path = os.path.join('data', 'analysis_results', 'all_analysis_results.csv')
+
+# 初始化CSV文件路径
+csv_file_path = None  # 先定义为None，在程序启动时初始化
+
 # 全局加权盈亏百分比
 weighted_profit = 0
 # 监控状态
@@ -59,10 +75,6 @@ AVAILABLE_SYMBOLS = {
 TITLE_CONFIG = {
     # 页面标题
     "main_title": "订单与价格实时监控系统",
-    # 控制面板
-    "control_panel_title": "控制面板",
-    # 订单统计
-    "order_stats_title": "订单统计",
     # 实时价格
     "realtime_price_title": "实时价格数据",
     # 价格表头
@@ -104,7 +116,7 @@ TITLE_CONFIG = {
         "profit_pct": "总计加权收益%",
         "result": "结果",
         "hold_time": "均持仓时间",
-        "risk_reward": "风险收益比"
+        "risk_reward_ratio": "风险收益比"
     },
     # 价格图表
     "price_chart_title": "价格历史图表"
@@ -927,7 +939,17 @@ def print_active_orders_status():
 @app.route('/')
 def index():
     """渲染主页"""
-    return render_template('order_price_monitor.html', symbols=AVAILABLE_SYMBOLS, title_config=TITLE_CONFIG)
+    # 添加控制变量，用于在前端控制是否显示搜索框和刷新按钮
+    control_config = {
+        'layout_version': 'simple',  # 使用简单布局，完全避免复杂的控件处理
+        'show_top_controls': False,  # 不显示顶部控制按钮
+        'hide_card_header_controls': False,  # 显示卡片头部的控制按钮
+        'single_control_only': True  # 只显示一组控件，完全禁用重复控件
+    }
+    return render_template('order_price_monitor.html', 
+                          symbols=AVAILABLE_SYMBOLS, 
+                          title_config=TITLE_CONFIG,
+                          control_config=control_config)
 
 @app.route('/health')
 def health_check():
@@ -1316,14 +1338,32 @@ def handle_refresh_csv():
     else:
         return {'status': 'info', 'message': 'CSV文件无更新或未找到符合条件的数据'}
 
+# 添加密码验证函数
+def verify_admin_password(password):
+    """验证管理员密码"""
+    if not password or password != ADMIN_PASSWORD:
+        logger.warning("密码验证失败")
+        return False
+    return True
+
 @socketio.on('edit_order')
 def handle_edit_order(data):
     """处理编辑订单请求"""
     global active_orders, orders_by_symbol
     
     try:
+        # 验证密码
+        if not verify_admin_password(data.get('admin_password')):
+            logger.warning("编辑订单失败：密码验证失败")
+            result = {'status': 'error', 'message': '无权限，密码错误'}
+            emit('edit_order_response', result)
+            return result
+            
         if 'order_id' not in data or 'updated_data' not in data:
-            return {'status': 'error', 'message': '缺少必要参数: order_id 或 updated_data'}
+            logger.warning("编辑订单失败：缺少必要参数")
+            result = {'status': 'error', 'message': '缺少必要参数: order_id 或 updated_data'}
+            emit('edit_order_response', result)
+            return result
         
         order_id = int(data['order_id'])
         updated_data = data['updated_data']
@@ -1336,10 +1376,50 @@ def handle_edit_order(data):
                 break
         
         if order_index == -1:
-            return {'status': 'error', 'message': f'未找到ID为{order_id}的订单'}
+            logger.warning(f"编辑订单失败：未找到ID为{order_id}的订单")
+            result = {'status': 'error', 'message': f'未找到ID为{order_id}的订单'}
+            emit('edit_order_response', result)
+            return result
         
         # 保存原始订单数据用于恢复
         original_order = dict(active_orders[order_index])
+        logger.info(f"开始编辑订单 ID: {order_id}, 原始数据: {original_order}")
+        
+        # 验证价格逻辑
+        try:
+            entry_price = float(updated_data.get('entry_price', original_order['entry_price']))
+            stop_loss = float(updated_data.get('stop_loss', original_order['stop_loss']))
+            target_price = float(updated_data.get('target_price', original_order['target_price']))
+            direction = updated_data.get('direction', original_order['direction'])
+            
+            # 验证价格逻辑
+            if direction == '多':
+                if stop_loss >= entry_price:
+                    logger.warning(f"编辑订单失败：多单止损价格 {stop_loss} 必须低于入场价格 {entry_price}")
+                    result = {'status': 'error', 'message': '多单的止损价格必须低于入场价格'}
+                    emit('edit_order_response', result)
+                    return result
+                if target_price <= entry_price:
+                    logger.warning(f"编辑订单失败：多单目标价格 {target_price} 必须高于入场价格 {entry_price}")
+                    result = {'status': 'error', 'message': '多单的目标价格必须高于入场价格'}
+                    emit('edit_order_response', result)
+                    return result
+            else:  # 空单
+                if stop_loss <= entry_price:
+                    logger.warning(f"编辑订单失败：空单止损价格 {stop_loss} 必须高于入场价格 {entry_price}")
+                    result = {'status': 'error', 'message': '空单的止损价格必须高于入场价格'}
+                    emit('edit_order_response', result)
+                    return result
+                if target_price >= entry_price:
+                    logger.warning(f"编辑订单失败：空单目标价格 {target_price} 必须低于入场价格 {entry_price}")
+                    result = {'status': 'error', 'message': '空单的目标价格必须低于入场价格'}
+                    emit('edit_order_response', result)
+                    return result
+        except (ValueError, TypeError) as e:
+            logger.error(f"编辑订单失败：价格数据格式错误 - {str(e)}")
+            result = {'status': 'error', 'message': f'价格数据格式错误: {str(e)}'}
+            emit('edit_order_response', result)
+            return result
         
         # 更新可编辑字段
         allowed_fields = [
@@ -1347,17 +1427,21 @@ def handle_edit_order(data):
             'channel', 'publish_time', 'result'
         ]
         
+        # 创建更新后的订单数据副本
+        updated_order = dict(original_order)
+        
         for field in allowed_fields:
             if field in updated_data:
                 if field in ['entry_price', 'target_price', 'stop_loss']:
                     try:
-                        # 尝试转换为浮点数
-                        active_orders[order_index][field] = float(updated_data[field])
+                        updated_order[field] = float(updated_data[field])
                     except (ValueError, TypeError):
-                        # 如果转换失败，保持原值
-                        pass
+                        logger.error(f"编辑订单失败：字段 {field} 的值必须是有效的数字")
+                        result = {'status': 'error', 'message': f'字段 {field} 的值必须是有效的数字'}
+                        emit('edit_order_response', result)
+                        return result
                 else:
-                    active_orders[order_index][field] = updated_data[field]
+                    updated_order[field] = updated_data[field]
         
         # 如果交易币种发生变化，更新normalized_symbol
         if 'symbol' in updated_data:
@@ -1365,24 +1449,162 @@ def handle_edit_order(data):
             # 检查是否为已知交易对
             for key, value in AVAILABLE_SYMBOLS.items():
                 if key in symbol_upper:
-                    active_orders[order_index]['normalized_symbol'] = value
+                    updated_order['normalized_symbol'] = value
                     break
+            else:
+                # 如果没有找到匹配的交易对，使用简单处理
+                simple_symbol = ''.join(c for c in symbol_upper if c.isalpha())
+                if simple_symbol:
+                    updated_order['normalized_symbol'] = f"{simple_symbol}USDT"
+                else:
+                    logger.error(f"编辑订单失败：无效的交易币种 {symbol_upper}")
+                    result = {'status': 'error', 'message': '无效的交易币种'}
+                    emit('edit_order_response', result)
+                    return result
         
         # 如果更新了入场价、目标价或止损价，重新计算风险收益比
         if any(field in updated_data for field in ['entry_price', 'target_price', 'stop_loss']):
-            direction = active_orders[order_index]['direction']
-            entry_price = active_orders[order_index]['entry_price']
-            target_price = active_orders[order_index]['target_price']
-            stop_loss = active_orders[order_index]['stop_loss']
+            direction = updated_order['direction']
+            entry_price = updated_order['entry_price']
+            target_price = updated_order['target_price']
+            stop_loss = updated_order['stop_loss']
             
             risk_reward_ratio = calculate_risk_reward_ratio(direction, entry_price, target_price, stop_loss)
-            active_orders[order_index]['risk_reward_ratio'] = risk_reward_ratio
+            updated_order['risk_reward_ratio'] = risk_reward_ratio
+        
+        # 更新CSV文件
+        try:
+            if os.path.exists(csv_file_path):
+                df = pd.read_csv(csv_file_path)
+                mask = None
+                if 'id' in df.columns:
+                    mask = df['id'] == order_id
+                    if not mask.any():
+                        logger.warning(f"在CSV文件中未找到要更新的订单行: ID={order_id}")
+                        # 尝试使用更多字段组合来确保找到正确的行
+                        if all(col in df.columns for col in ['analysis.交易币种', 'analysis.入场点位1', 'analysis.方向', 'channel']):
+                            mask = (
+                                (df['analysis.交易币种'] == original_order['symbol']) & 
+                                (df['analysis.入场点位1'] == original_order['entry_price']) &
+                                (df['analysis.方向'] == original_order['direction']) &
+                                (df['channel'] == original_order['channel'])
+                            )
+                            if not mask.any():
+                                logger.error(f"使用严格条件仍未找到要更新的订单行: ID={order_id}")
+                                # 最后尝试使用最宽松的条件
+                                if all(col in df.columns for col in ['analysis.交易币种', 'analysis.方向']):
+                                    mask = (
+                                        (df['analysis.交易币种'] == original_order['symbol']) & 
+                                        (df['analysis.方向'] == original_order['direction'])
+                                    )
+                                    if not mask.any():
+                                        logger.error(f"使用宽松条件仍未找到要更新的订单行: ID={order_id}")
+                                        result = {'status': 'error', 'message': '在CSV文件中未找到要更新的订单'}
+                                        emit('edit_order_response', result)
+                                        return result
+                                else:
+                                    result = {'status': 'error', 'message': 'CSV文件缺少必要的列，无法定位订单'}
+                                    emit('edit_order_response', result)
+                                    return result
+                        else:
+                            result = {'status': 'error', 'message': 'CSV文件缺少必要的列，无法定位订单'}
+                            emit('edit_order_response', result)
+                            return result
+                else:
+                    # 如果没有id列，使用更多字段组合来确保找到正确的行
+                    if all(col in df.columns for col in ['analysis.交易币种', 'analysis.入场点位1', 'analysis.方向', 'channel']):
+                        mask = (
+                            (df['analysis.交易币种'] == original_order['symbol']) & 
+                            (df['analysis.入场点位1'] == original_order['entry_price']) &
+                            (df['analysis.方向'] == original_order['direction']) &
+                            (df['channel'] == original_order['channel'])
+                        )
+                        if not mask.any():
+                            logger.error(f"使用严格条件仍未找到要更新的订单行: 没有id列")
+                            # 最后尝试使用最宽松的条件
+                            if all(col in df.columns for col in ['analysis.交易币种', 'analysis.方向']):
+                                mask = (
+                                    (df['analysis.交易币种'] == original_order['symbol']) & 
+                                    (df['analysis.方向'] == original_order['direction'])
+                                )
+                                if not mask.any():
+                                    logger.error(f"使用宽松条件仍未找到要更新的订单行: 没有id列")
+                                    result = {'status': 'error', 'message': '在CSV文件中未找到要更新的订单'}
+                                    emit('edit_order_response', result)
+                                    return result
+                            else:
+                                result = {'status': 'error', 'message': 'CSV文件缺少必要的列，无法定位订单'}
+                                emit('edit_order_response', result)
+                                return result
+                    else:
+                        result = {'status': 'error', 'message': 'CSV文件缺少必要的列，无法定位订单'}
+                        emit('edit_order_response', result)
+                        return result
+                # 记录找到的行数
+                matching_rows = mask.sum() if mask is not None else 0
+                if matching_rows == 0:
+                    # 自动模糊匹配：币种+方向+入场价误差在1e-6以内
+                    import numpy as np
+                    candidates = df
+                    if 'analysis.交易币种' in df.columns:
+                        candidates = candidates[candidates['analysis.交易币种'] == original_order['symbol']]
+                    if 'analysis.方向' in df.columns:
+                        candidates = candidates[candidates['analysis.方向'] == original_order['direction']]
+                    if 'analysis.入场点位1' in df.columns:
+                        try:
+                            candidates = candidates[np.isclose(candidates['analysis.入场点位1'].astype(float), float(original_order['entry_price']), atol=1e-6)]
+                        except Exception as e:
+                            logger.error(f"模糊匹配入场价时出错: {e}")
+                    if len(candidates) > 0:
+                        mask = df.index.isin(candidates.index)
+                        logger.warning(f"未找到完全匹配，已自动采用模糊匹配行 index={list(candidates.index)} 进行修正")
+                        matching_rows = mask.sum()
+                    else:
+                        result = {'status': 'error', 'message': '在CSV文件中未找到要更新的订单（已尝试模糊匹配）'}
+                        emit('edit_order_response', result)
+                        return result
+                if matching_rows > 1:
+                    logger.warning(f"在CSV文件中找到多个匹配的行 ({matching_rows}行)，将更新所有匹配的行")
+                # 更新找到的行
+                for field in allowed_fields:
+                    if field in updated_data:
+                        csv_field = f'analysis.{field}' if field in ['symbol', 'direction', 'entry_price', 'stop_loss', 'target_price'] else field
+                        if csv_field in df.columns:
+                            df.loc[mask, csv_field] = updated_data[field]
+                # 保存更新后的CSV
+                backup_path = f"{csv_file_path}.bak"
+                try:
+                    # 先创建备份
+                    df.to_csv(backup_path, index=False)
+                    # 如果备份成功，再更新原文件
+                    df.to_csv(csv_file_path, index=False)
+                    logger.info(f"成功更新CSV文件中的订单 ID: {order_id}")
+                except Exception as e:
+                    logger.error(f"保存CSV文件时出错: {str(e)}")
+                    # 如果更新失败，尝试恢复备份
+                    if os.path.exists(backup_path):
+                        os.replace(backup_path, csv_file_path)
+                    raise
+                finally:
+                    # 清理备份文件
+                    if os.path.exists(backup_path):
+                        os.remove(backup_path)
+        except Exception as e:
+            logger.error(f"更新CSV文件时出错: {str(e)}")
+            # 回滚内存中的更改
+            active_orders[order_index] = original_order
+            result = {'status': 'error', 'message': f'更新CSV文件失败: {str(e)}'}
+            emit('edit_order_response', result)
+            return result
+        
+        # 更新内存中的订单数据
+        active_orders[order_index] = updated_order
         
         # 更新按币种分类的订单字典
         for symbol, orders in orders_by_symbol.items():
             for i, order in enumerate(orders):
                 if order.get('id') == order_id:
-                    orders_by_symbol[symbol][i] = active_orders[order_index]
+                    orders_by_symbol[symbol][i] = updated_order
                     break
         
         # 将更新后的订单数据发送给所有客户端
@@ -1392,79 +1614,136 @@ def handle_edit_order(data):
             'timestamp': time.time()
         })
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 订单已编辑: ID={order_id}")
-        return {'status': 'success', 'message': '订单更新成功'}
+        logger.info(f"订单已成功编辑: ID={order_id}")
+        result = {'status': 'success', 'message': '订单更新成功'}
+        emit('edit_order_response', result)
+        return result
     
     except Exception as e:
-        print(f"编辑订单时出错: {e}")
-        return {'status': 'error', 'message': f'编辑订单失败: {str(e)}'}
+        logger.error(f"编辑订单时出错: {str(e)}")
+        # 如果发生异常，尝试回滚内存中的更改
+        if 'order_index' in locals() and order_index != -1 and 'original_order' in locals():
+            active_orders[order_index] = original_order
+        result = {'status': 'error', 'message': f'编辑订单失败: {str(e)}'}
+        emit('edit_order_response', result)
+        return result
 
 @socketio.on('delete_order')
 def handle_delete_order(data):
-    """处理删除订单请求"""
     global active_orders, orders_by_symbol
     
     try:
-        if 'order_id' not in data:
-            return {'status': 'error', 'message': '缺少必要参数: order_id'}
+        # 验证密码
+        if not verify_admin_password(data.get('admin_password')):
+            return {'status': 'error', 'message': '无权限，密码错误'}
         
+        # 获取订单ID
         order_id = int(data['order_id'])
+        logger.info(f"尝试删除订单 ID: {order_id}")
         
-        # 查找对应ID的订单
-        order_index = -1
+        # 找到要删除的订单
         order_to_delete = None
-        for i, order in enumerate(active_orders):
+        for order in active_orders:
             if order.get('id') == order_id:
-                order_index = i
                 order_to_delete = order
                 break
-        
-        if order_index == -1 or not order_to_delete:
+                
+        if not order_to_delete:
+            logger.warning(f"删除订单失败：未找到ID为{order_id}的订单")
             return {'status': 'error', 'message': f'未找到ID为{order_id}的订单'}
         
-        # 从活跃订单列表中删除
-        del active_orders[order_index]
+        # 从CSV文件中删除
+        try:
+            if os.path.exists(csv_file_path):
+                logger.info(f"正在从CSV文件删除订单: {csv_file_path}")
+                
+                # 读取CSV文件
+                df = pd.read_csv(csv_file_path)
+                original_rows = len(df)
+                
+                # 尝试通过ID删除
+                if 'id' in df.columns:
+                    df = df[df['id'] != order_id]
+                else:
+                    # 如果没有ID列，使用symbol和entry_price组合删除
+                    symbol_col = 'analysis.交易币种'
+                    entry_col = 'analysis.入场点位1'
+                    
+                    if symbol_col in df.columns and entry_col in df.columns:
+                        df = df[~((df[symbol_col] == order_to_delete['symbol']) & 
+                                (df[entry_col] == order_to_delete['entry_price']))]
+                    else:
+                        logger.error("CSV文件缺少必要的列用于删除订单")
+                        return {'status': 'error', 'message': 'CSV文件格式不正确，无法删除订单'}
+                
+                # 检查是否成功删除
+                if len(df) < original_rows:
+                    # 使用安全的保存方法
+                    if save_to_csv(df):
+                        logger.info(f"成功从CSV文件删除订单，行数从 {original_rows} 减少到 {len(df)}")
+                    else:
+                        logger.error("保存CSV文件失败")
+                        return {'status': 'error', 'message': '保存CSV文件失败'}
+                else:
+                    logger.warning("CSV文件中未找到匹配的订单记录")
+        except Exception as e:
+            logger.error(f"从CSV文件删除订单时出错: {str(e)}")
+            return {'status': 'error', 'message': f'从CSV文件删除订单失败: {str(e)}'}
         
-        # 从按币种分类的订单字典中删除
-        for symbol, orders in orders_by_symbol.items():
-            for i, order in enumerate(orders):
-                if order.get('id') == order_id:
-                    del orders_by_symbol[symbol][i]
-                    break
+        # 从内存中删除
+        try:
+            # 从活跃订单列表中删除
+            active_orders = [o for o in active_orders if o.get('id') != order_id]
+            
+            # 从按币种分类的字典中删除
+            for symbol, orders in orders_by_symbol.items():
+                orders_by_symbol[symbol] = [o for o in orders if o.get('id') != order_id]
+            
+            logger.info(f"成功从内存中删除订单 ID: {order_id}")
+        except Exception as e:
+            logger.error(f"从内存中删除订单时出错: {str(e)}")
+            return {'status': 'error', 'message': f'从内存中删除订单失败: {str(e)}'}
         
-        # 将更新后的订单数据发送给所有客户端
-        serializable_active_orders = make_json_serializable(active_orders)
-        socketio.emit('orders_update', {
-            'active_orders': serializable_active_orders,
-            'timestamp': time.time()
-        })
+        # 通知前端更新
+        try:
+            serializable_active_orders = make_json_serializable(active_orders)
+            socketio.emit('orders_update', {
+                'active_orders': serializable_active_orders,
+                'timestamp': time.time()
+            })
+            logger.info("已通知前端更新订单列表")
+        except Exception as e:
+            logger.error(f"通知前端更新时出错: {str(e)}")
+            # 继续执行，因为订单已经成功删除
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 订单已删除: ID={order_id}, 币种={order_to_delete.get('symbol', 'unknown')}")
-        return {'status': 'success', 'message': '订单删除成功'}
-    
+        return {'status': 'success', 'message': '订单已成功删除'}
+        
     except Exception as e:
-        print(f"删除订单时出错: {e}")
+        logger.error(f"删除订单过程中发生错误: {str(e)}")
         return {'status': 'error', 'message': f'删除订单失败: {str(e)}'}
 
 @socketio.on('add_order')
 def handle_add_order(data):
-    """处理添加订单请求"""
     global active_orders, orders_by_symbol
     
     try:
+        # 验证密码
+        if not verify_admin_password(data.get('admin_password')):
+            return {'status': 'error', 'message': '无权限，密码错误'}
+            
+        # 验证必要字段
         required_fields = ['symbol', 'direction', 'entry_price']
         for field in required_fields:
             if field not in data:
                 return {'status': 'error', 'message': f'缺少必要字段: {field}'}
         
-        # 获取最大订单ID
+        # 生成新订单ID
         max_id = max([order.get('id', 0) for order in active_orders + completed_orders], default=0)
         
-        # 基本信息
+        # 处理输入数据
         symbol = data.get('symbol')
         direction = data.get('direction', '多')
         
-        # 确保入场价格是有效的浮点数
         try:
             entry_price = float(data.get('entry_price'))
         except (ValueError, TypeError):
@@ -1474,13 +1753,11 @@ def handle_add_order(data):
         try:
             stop_loss = float(data.get('stop_loss', 0))
             if stop_loss <= 0:
-                # 根据方向计算默认止损价格
                 if direction == '多':
-                    stop_loss = entry_price * 0.95  # 默认止损为入场价格的95%
+                    stop_loss = entry_price * 0.95
                 else:
-                    stop_loss = entry_price * 1.05  # 默认止损为入场价格的105%
+                    stop_loss = entry_price * 1.05
         except (ValueError, TypeError):
-            # 计算默认止损价格
             if direction == '多':
                 stop_loss = entry_price * 0.95
             else:
@@ -1490,15 +1767,13 @@ def handle_add_order(data):
         try:
             target_price = float(data.get('target_price', 0))
             if target_price <= 0:
-                # 根据方向和止损计算默认值
                 if direction == '多':
                     price_diff = entry_price - stop_loss
-                    target_price = entry_price + price_diff * 2  # 风险收益比2:1
+                    target_price = entry_price + price_diff * 2
                 else:
                     price_diff = stop_loss - entry_price
-                    target_price = entry_price - price_diff * 2  # 风险收益比2:1
+                    target_price = entry_price - price_diff * 2
         except (ValueError, TypeError):
-            # 计算默认目标价格
             if direction == '多':
                 price_diff = entry_price - stop_loss
                 target_price = entry_price + price_diff * 2
@@ -1506,17 +1781,14 @@ def handle_add_order(data):
                 price_diff = stop_loss - entry_price
                 target_price = entry_price - price_diff * 2
         
-        # 标准化交易对
+        # 处理交易对
         symbol_upper = str(symbol).upper()
         normalized_symbol = None
-        
-        # 支持所有币种类型
         for key, value in AVAILABLE_SYMBOLS.items():
             if key in symbol_upper:
                 normalized_symbol = value
                 break
         
-        # 如果没有匹配的币种，创建一个简化的币种名称
         if not normalized_symbol:
             simple_symbol = ''.join(c for c in symbol_upper if c.isalpha())
             if simple_symbol:
@@ -1524,16 +1796,11 @@ def handle_add_order(data):
             else:
                 return {'status': 'error', 'message': '无效的交易币种'}
         
-        # 频道信息
+        # 创建新订单对象
         channel = data.get('channel', '手动添加')
-        
-        # 发布时间
         publish_time = data.get('publish_time', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-        
-        # 计算风险收益比
         risk_reward_ratio = calculate_risk_reward_ratio(direction, entry_price, target_price, stop_loss)
         
-        # 创建新订单
         new_order = create_order_object(
             id_num=max_id + 1,
             symbol=symbol,
@@ -1555,27 +1822,66 @@ def handle_add_order(data):
             source="manual_add"
         )
         
-        # 添加到活跃订单列表
-        active_orders.append(new_order)
+        # 写入CSV文件
+        try:
+            if os.path.exists(csv_file_path):
+                df = pd.read_csv(csv_file_path)
+                # 准备新行数据
+                new_row = {
+                    'analysis.交易币种': symbol,
+                    'analysis.方向': direction,
+                    'analysis.入场点位1': entry_price,
+                    'analysis.止损点位1': stop_loss,
+                    'analysis.止盈点位1': target_price,
+                    'channel': channel,
+                    'timestamp': publish_time
+                }
+                # 添加新行
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                if save_to_csv(df):
+                    logger.info("成功将新订单写入CSV文件")
+                else:
+                    logger.error("保存CSV文件失败")
+                    return {'status': 'error', 'message': '保存CSV文件失败'}
+            else:
+                # 如果文件不存在，创建新文件
+                new_df = pd.DataFrame([{
+                    'analysis.交易币种': symbol,
+                    'analysis.方向': direction,
+                    'analysis.入场点位1': entry_price,
+                    'analysis.止损点位1': stop_loss,
+                    'analysis.止盈点位1': target_price,
+                    'channel': channel,
+                    'timestamp': publish_time
+                }])
+                if save_to_csv(new_df):
+                    logger.info("创建新的CSV文件并写入订单")
+                else:
+                    logger.error("创建CSV文件失败")
+                    return {'status': 'error', 'message': '创建CSV文件失败'}
+        except Exception as e:
+            logger.error(f"写入CSV文件时出错: {str(e)}")
+            return {'status': 'error', 'message': f'保存订单到CSV文件失败: {str(e)}'}
         
-        # 添加到按币种分类的字典
+        # 添加到内存
+        active_orders.append(new_order)
         symbol_key = symbol_upper.replace("USDT", "")
         if symbol_key not in orders_by_symbol:
             orders_by_symbol[symbol_key] = []
         orders_by_symbol[symbol_key].append(new_order)
         
-        # 将更新后的订单数据发送给所有客户端
+        # 通知前端更新
         serializable_active_orders = make_json_serializable(active_orders)
         socketio.emit('orders_update', {
             'active_orders': serializable_active_orders,
             'timestamp': time.time()
         })
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 新订单已添加: {symbol} {direction} 入场:{entry_price} 止损:{stop_loss}")
+        logger.info(f"新订单已添加: {symbol} {direction} 入场:{entry_price} 止损:{stop_loss}")
         return {'status': 'success', 'message': '订单添加成功', 'order_id': new_order['id']}
-    
+        
     except Exception as e:
-        print(f"添加订单时出错: {e}")
+        logger.error(f"添加订单时出错: {str(e)}")
         return {'status': 'error', 'message': f'添加订单失败: {str(e)}'}
 
 @socketio.on('get_csv_status')
@@ -1758,6 +2064,465 @@ def update_price_data(session=None):
         print(f"更新价格数据时出错: {e}")
         return False
 
+@app.route('/charts/<path:filename>')
+def serve_chart(filename):
+    """提供图表文件"""
+    try:
+        charts_dir = os.path.join(os.path.expanduser('~'), 'Desktop', '交易分析图表')
+        if not os.path.exists(charts_dir):
+            return jsonify({'error': '图表目录不存在'}), 404
+            
+        file_path = os.path.join(charts_dir, filename)
+        if not os.path.exists(file_path):
+            return jsonify({'error': f'找不到文件: {filename}'}), 404
+            
+        return send_from_directory(charts_dir, filename)
+    except Exception as e:
+        print(f"提供图表文件时出错: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/charts')
+def list_charts():
+    """列出所有可用的图表"""
+    charts_dir = os.path.join(os.path.expanduser('~'), 'Desktop', '交易分析图表')
+    if not os.path.exists(charts_dir):
+        return jsonify({'status': 'error', 'message': '图表目录不存在'})
+    
+    charts = []
+    for file in os.listdir(charts_dir):
+        if file.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg')):
+            charts.append({
+                'name': file,
+                'url': f'/charts/{file}',
+                'type': 'image'
+            })
+        elif file.endswith(('.html', '.htm')):
+            charts.append({
+                'name': file,
+                'url': f'/charts/{file}',
+                'type': 'html'
+            })
+    
+    return jsonify({
+        'status': 'success',
+        'charts': charts
+    })
+
+@app.route('/trade_report')
+def trade_report():
+    import pandas as pd
+    import numpy as np
+    import json
+    from datetime import datetime
+    import traceback
+    
+    try:
+        logger.info("开始处理交易分析报告请求...")
+        excel_path = os.path.expanduser('~/Desktop/交易分析报告.xlsx')
+        charts_dir = os.path.join(os.path.expanduser('~'), 'Desktop', '交易分析图表')
+        
+        logger.info(f"Excel文件路径: {excel_path}")
+        logger.info(f"图表目录路径: {charts_dir}")
+        
+        result = {'success': True, 'tables': [], 'images': []}
+        
+        # 自定义JSON编码器处理特殊值
+        class CustomJSONEncoder(json.JSONEncoder):
+            def default(self, obj):
+                try:
+                    if isinstance(obj, (np.integer, np.int64)):
+                        return int(obj)
+                    elif isinstance(obj, (float, np.float64)):
+                        return float(obj) if not np.isnan(obj) else None
+                    elif isinstance(obj, (datetime, pd.Timestamp)):
+                        return obj.strftime('%Y-%m-%d %H:%M:%S')
+                    elif isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    return super().default(obj)
+                except Exception as e:
+                    logger.error(f"JSON编码错误: {str(e)}")
+                    return None
+        
+        # 清理DataFrame中的特殊值
+        def clean_dataframe(df):
+            try:
+                # 替换NaN为None
+                df = df.replace({np.nan: None})
+                # 转换日期时间列
+                for col in df.columns:
+                    if pd.api.types.is_datetime64_any_dtype(df[col]):
+                        df[col] = df[col].dt.strftime('%Y-%m-%d %H:%M:%S')
+                return df
+            except Exception as e:
+                logger.error(f"清理DataFrame时出错: {str(e)}")
+                return df
+        
+        # 读取所有Sheet表格
+        if os.path.exists(excel_path):
+            try:
+                logger.info("开始读取Excel文件...")
+                xl = pd.ExcelFile(excel_path)
+                logger.info(f"Excel文件包含以下sheet: {xl.sheet_names}")
+                
+                for sheet in xl.sheet_names:
+                    try:
+                        logger.info(f"正在处理sheet: {sheet}")
+                        df = xl.parse(sheet)
+                        # 清理数据
+                        df = clean_dataframe(df)
+                        # 转换为列表并处理特殊值
+                        rows = []
+                        for _, row in df.iterrows():
+                            try:
+                                row_dict = row.to_dict()
+                                # 处理每个值
+                                for key, value in row_dict.items():
+                                    if pd.isna(value):
+                                        row_dict[key] = None
+                                    elif isinstance(value, (np.integer, np.int64)):
+                                        row_dict[key] = int(value)
+                                    elif isinstance(value, (float, np.float64)):
+                                        row_dict[key] = float(value) if not np.isnan(value) else None
+                                rows.append(row_dict)
+                            except Exception as e:
+                                logger.error(f"处理行数据时出错: {str(e)}")
+                                continue
+                        
+                        table_data = {
+                            'sheet': sheet,
+                            'columns': df.columns.tolist(),
+                            'rows': rows
+                        }
+                        result['tables'].append(table_data)
+                        logger.info(f"成功处理sheet: {sheet}")
+                    except Exception as e:
+                        logger.error(f"处理sheet {sheet} 时出错: {str(e)}")
+                        continue
+            except Exception as e:
+                logger.error(f"读取Excel文件时出错: {str(e)}")
+                return jsonify({'success': False, 'msg': f'读取Excel文件时出错: {str(e)}'})
+        else:
+            logger.error(f"Excel文件不存在: {excel_path}")
+            return jsonify({'success': False, 'msg': f'找不到文件: {excel_path}'})
+        
+        # 读取所有图表图片
+        if os.path.exists(charts_dir):
+            try:
+                logger.info("开始读取图表文件...")
+                for file in os.listdir(charts_dir):
+                    if file.endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg')):
+                        try:
+                            # 从文件名中提取标题
+                            title = os.path.splitext(file)[0]  # 移除扩展名
+                            title = title.replace('_每日交易分析图', '')  # 移除后缀
+                            
+                            result['images'].append({
+                                'title': title,
+                                'url': f'/charts/{file}',
+                                'filename': file
+                            })
+                        except Exception as e:
+                            logger.error(f"处理图表文件 {file} 时出错: {str(e)}")
+                            continue
+                logger.info(f"成功读取 {len(result['images'])} 个图表文件")
+            except Exception as e:
+                logger.error(f"读取图表文件时出错: {str(e)}")
+                return jsonify({'success': False, 'msg': f'读取图表文件时出错: {str(e)}'})
+        else:
+            logger.error(f"图表目录不存在: {charts_dir}")
+            return jsonify({'success': False, 'msg': f'找不到图表目录: {charts_dir}'})
+        
+        logger.info("所有数据处理完成，准备返回结果...")
+        # 使用自定义JSON编码器
+        response = jsonify(result)
+        response.headers['Content-Type'] = 'application/json'
+        return response
+        
+    except Exception as e:
+        logger.error(f"处理交易分析报告时出错: {str(e)}")
+        logger.error("错误详情:")
+        logger.error(traceback.format_exc())
+        return jsonify({'success': False, 'msg': f'处理交易分析报告时出错: {str(e)}'})
+
+@app.route('/trade_analysis_data')
+def trade_analysis_data():
+    """读取交易分析报告并返回分析数据"""
+    try:
+        # 读取Excel文件
+        excel_path = os.path.expanduser('~/Desktop/交易分析报告.xlsx')
+        print(f"尝试读取Excel文件: {excel_path}")
+        
+        if not os.path.exists(excel_path):
+            print(f"Excel文件不存在: {excel_path}")
+            return jsonify({
+                'success': False,
+                'msg': '找不到交易分析报告文件'
+            })
+
+        # 读取各个Sheet
+        print("开始读取Excel文件...")
+        with pd.ExcelFile(excel_path) as xl:
+            print(f"Excel文件包含以下sheet: {xl.sheet_names}")
+            
+            # 1. 读取总体统计
+            print("读取总体统计sheet...")
+            summary_df = pd.read_excel(xl, sheet_name='总体统计')
+            summary = summary_df.iloc[0].to_dict()
+            print(f"总体统计数据: {summary}")
+
+            # 2. 读取每日收益率总结表
+            print("读取每日收益率总结表sheet...")
+            daily_df = pd.read_excel(xl, sheet_name='每日收益率总结表')
+            daily = daily_df.to_dict('records')
+            print(f"每日收益率数据条数: {len(daily)}")
+
+            # 3. 读取详细交易（可选）
+            print("读取详细交易sheet...")
+            trades_df = pd.read_excel(xl, sheet_name='详细交易')
+            trades = trades_df.head(100).to_dict('records')
+            print(f"详细交易数据条数: {len(trades)}")
+
+        # 4. 获取图表文件列表
+        charts_dir = os.path.join(os.path.expanduser('~'), 'Desktop', '交易分析图表')
+        print(f"查找图表文件目录: {charts_dir}")
+        charts = []
+        if os.path.exists(charts_dir):
+            for file in os.listdir(charts_dir):
+                if file.endswith(('.png', '.jpg', '.jpeg')):
+                    charts.append({
+                        'title': os.path.splitext(file)[0],
+                        'url': f'/charts/{file}'
+                    })
+            print(f"找到 {len(charts)} 个图表文件")
+
+        # 5. 返回完整数据
+        response_data = {
+            'success': True,
+            'summary': summary,
+            'daily': daily,
+            'trades': trades,
+            'charts': charts
+        }
+        print("准备返回数据...")
+        return jsonify(response_data)
+
+    except Exception as e:
+        print(f"读取分析数据时出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'msg': f'读取分析数据时出错: {str(e)}'
+        })
+
+ADMIN_PASSWORD = "1234"  # 请替换为你自己的密码
+
+@app.route('/orders')
+def get_orders():
+    """获取活跃订单或已完成订单，让客户端处理搜索和分页"""
+    order_type = request.args.get('type', 'active')
+    try:
+        # 获取DataTables发送的参数
+        draw = int(request.args.get('draw', 1))
+    except Exception as e:
+        logger.error(f"处理订单请求参数时出错: {e}")
+        draw = 1
+
+    # 获取原始订单数据
+    if order_type == 'active':
+        orders = active_orders
+    else:
+        orders = completed_orders
+    
+    total_records = len(orders)
+    
+    # 确保JSON可序列化
+    orders = make_json_serializable(orders)
+
+    return jsonify({
+        'data': orders,
+        'recordsTotal': total_records,
+        'recordsFiltered': total_records,
+        'draw': draw,
+    })
+
+# 在文件开头添加CSV文件路径配置
+import os
+from pathlib import Path
+
+# 定义CSV文件路径
+def get_csv_file_path():
+    """获取CSV文件的绝对路径，并确保目录存在"""
+    try:
+        # 使用用户桌面目录
+        desktop_path = os.path.expanduser('~/Desktop')
+        # 在桌面创建data目录
+        data_dir = os.path.join(desktop_path, 'discord-monitor-data')
+        # 确保目录存在
+        os.makedirs(data_dir, exist_ok=True)
+        # 返回CSV文件的完整路径
+        csv_path = os.path.join(data_dir, 'all_analysis_results.csv')
+        
+        # 检查文件权限
+        if os.path.exists(csv_path):
+            # 检查文件是否可写
+            if not os.access(csv_path, os.W_OK):
+                logger.error(f"CSV文件没有写入权限: {csv_path}")
+                # 尝试修改文件权限
+                try:
+                    os.chmod(csv_path, 0o666)  # 给予读写权限
+                    logger.info(f"已修改CSV文件权限: {csv_path}")
+                except Exception as e:
+                    logger.error(f"无法修改CSV文件权限: {str(e)}")
+                    # 尝试使用管理员权限
+                    try:
+                        import ctypes
+                        if os.name == 'nt':  # Windows系统
+                            ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f'/c icacls "{csv_path}" /grant Everyone:F', None, 1)
+                            logger.info("已尝试使用管理员权限修改文件权限")
+                    except Exception as e:
+                        logger.error(f"使用管理员权限修改文件权限失败: {str(e)}")
+        else:
+            # 如果文件不存在，创建一个空文件
+            try:
+                with open(csv_path, 'w', encoding='utf-8') as f:
+                    f.write("timestamp,analysis.交易币种,analysis.方向,analysis.入场点位1,analysis.止损点位1,analysis.止盈点位1,channel\n")
+                # 设置文件权限
+                os.chmod(csv_path, 0o666)
+                logger.info(f"已创建新的CSV文件: {csv_path}")
+            except Exception as e:
+                logger.error(f"创建CSV文件失败: {str(e)}")
+                # 尝试使用管理员权限创建
+                try:
+                    import ctypes
+                    if os.name == 'nt':  # Windows系统
+                        temp_path = os.path.join(os.environ['TEMP'], 'temp_csv.csv')
+                        with open(temp_path, 'w', encoding='utf-8') as f:
+                            f.write("timestamp,analysis.交易币种,analysis.方向,analysis.入场点位1,analysis.止损点位1,analysis.止盈点位1,channel\n")
+                        ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f'/c move /Y "{temp_path}" "{csv_path}"', None, 1)
+                        logger.info("已尝试使用管理员权限创建文件")
+                except Exception as e:
+                    logger.error(f"使用管理员权限创建文件失败: {str(e)}")
+        
+        return csv_path
+    except Exception as e:
+        logger.error(f"获取CSV文件路径时出错: {str(e)}")
+        return None
+
+def save_to_csv(df):
+    """安全地保存DataFrame到CSV文件"""
+    global csv_file_path
+    
+    try:
+        if csv_file_path is None:
+            logger.error("CSV文件路径无效")
+            return False
+            
+        # 确保目录存在
+        os.makedirs(os.path.dirname(csv_file_path), exist_ok=True)
+        
+        # 尝试保存文件
+        temp_path = os.path.join(os.environ['TEMP'], 'temp_csv.csv')
+        df.to_csv(temp_path, index=False, encoding='utf-8')
+        
+        # 如果临时文件保存成功，替换原文件
+        if os.path.exists(temp_path):
+            try:
+                # 尝试直接移动文件
+                if os.path.exists(csv_file_path):
+                    os.remove(csv_file_path)
+                os.rename(temp_path, csv_file_path)
+            except Exception as e:
+                logger.error(f"移动文件失败，尝试使用管理员权限: {str(e)}")
+                try:
+                    # 尝试使用管理员权限移动文件
+                    import ctypes
+                    if os.name == 'nt':  # Windows系统
+                        ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f'/c move /Y "{temp_path}" "{csv_file_path}"', None, 1)
+                        logger.info("已尝试使用管理员权限移动文件")
+                except Exception as e:
+                    logger.error(f"使用管理员权限移动文件失败: {str(e)}")
+                    return False
+            
+            # 设置文件权限
+            try:
+                os.chmod(csv_file_path, 0o666)
+            except Exception as e:
+                logger.error(f"设置文件权限失败: {str(e)}")
+            
+            logger.info(f"成功保存CSV文件: {csv_file_path}")
+            return True
+        else:
+            logger.error("保存临时文件失败")
+            return False
+            
+    except Exception as e:
+        logger.error(f"保存CSV文件时出错: {str(e)}")
+        # 清理临时文件
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+        return False
+
+# 在程序启动时添加权限检查
+def check_file_permissions():
+    """检查并确保文件权限正确"""
+    global csv_file_path
+    
+    try:
+        if csv_file_path and os.path.exists(csv_file_path):
+            # 检查文件权限
+            if not os.access(csv_file_path, os.W_OK):
+                logger.warning(f"CSV文件没有写入权限，尝试修复: {csv_file_path}")
+                try:
+                    # 尝试修改文件权限
+                    os.chmod(csv_file_path, 0o666)
+                    logger.info("已修改文件权限")
+                except Exception as e:
+                    logger.error(f"修改文件权限失败: {str(e)}")
+                    # 尝试使用管理员权限
+                    try:
+                        import ctypes
+                        if os.name == 'nt':  # Windows系统
+                            ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", f'/c icacls "{csv_file_path}" /grant Everyone:F', None, 1)
+                            logger.info("已尝试使用管理员权限修改文件权限")
+                    except Exception as e:
+                        logger.error(f"使用管理员权限修改文件权限失败: {str(e)}")
+    except Exception as e:
+        logger.error(f"检查文件权限时出错: {str(e)}")
+
+def initialize_csv_file():
+    """初始化CSV文件路径和权限"""
+    global csv_file_path
+    try:
+        # 获取CSV文件路径
+        csv_file_path = get_csv_file_path()
+        if csv_file_path is None:
+            logger.error("无法初始化CSV文件路径")
+            return False
+            
+        # 检查文件权限
+        check_file_permissions()
+        
+        # 确保文件存在
+        if not os.path.exists(csv_file_path):
+            try:
+                with open(csv_file_path, 'w', encoding='utf-8') as f:
+                    f.write("timestamp,analysis.交易币种,analysis.方向,analysis.入场点位1,analysis.止损点位1,analysis.止盈点位1,channel\n")
+                os.chmod(csv_file_path, 0o666)
+                logger.info(f"已创建新的CSV文件: {csv_file_path}")
+            except Exception as e:
+                logger.error(f"创建CSV文件失败: {str(e)}")
+                return False
+        
+        logger.info(f"CSV文件初始化成功: {csv_file_path}")
+        return True
+    except Exception as e:
+        logger.error(f"初始化CSV文件时出错: {str(e)}")
+        return False
+
 if __name__ == '__main__':
     # 禁用所有非关键日志
     import logging
@@ -1768,6 +2533,14 @@ if __name__ == '__main__':
     for logger_name in ['socketio', 'engineio', 'werkzeug', 'geventwebsocket', 'flask', 'websocket']:
         logger = logging.getLogger(logger_name)
         logger.setLevel(logging.WARNING)
+    
+    # 初始化CSV文件路径
+    csv_file_path = get_csv_file_path()
+    
+    # 初始化CSV文件
+    if not initialize_csv_file():
+        logger.error("CSV文件初始化失败，程序可能无法正常工作")
+        print("警告：CSV文件初始化失败，程序可能无法正常工作")
     
     # 打印欢迎信息和ASCII艺术标题
     print("\n")
@@ -1813,35 +2586,35 @@ if __name__ == '__main__':
     print("订单数据加载完成")
     
     # 检查CSV文件
-    print(f"检查CSV文件: {csv_file_path}")
-    try:
-        # 确保data/analysis_results目录存在
-        os.makedirs(os.path.dirname(csv_file_path), exist_ok=True)
-        
-        if os.path.exists(csv_file_path):
-            file_size = os.path.getsize(csv_file_path) / 1024  # KB
-            modification_time = datetime.fromtimestamp(os.path.getmtime(csv_file_path))
-            print(f"  CSV文件存在: 大小 {file_size:.2f} KB, 最后修改时间: {modification_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            # 保存文件修改时间
-            last_csv_modification_time = os.path.getmtime(csv_file_path)
-            
-            # 尝试从CSV文件加载初始数据
-            print("  正在从CSV文件加载初始订单数据...")
-            initial_load = monitor_csv_file()
-            if initial_load:
-                print(f"  成功从CSV文件加载初始订单数据，活跃订单: {len(active_orders)}个")
-            else:
-                print("  未从CSV文件中找到符合条件的初始订单数据")
-        else:
-            print(f"  CSV文件不存在，将创建一个空文件用于后续监控")
-            with open(csv_file_path, 'w') as f:
-                f.write("timestamp,analysis.交易币种,analysis.方向,analysis.入场点位1,analysis.止损点位1,analysis.止盈点位1\n")
+    if csv_file_path:
+        print(f"检查CSV文件: {csv_file_path}")
+        try:
+            if os.path.exists(csv_file_path):
+                file_size = os.path.getsize(csv_file_path) / 1024  # KB
+                modification_time = datetime.fromtimestamp(os.path.getmtime(csv_file_path))
+                print(f"  CSV文件存在: 大小 {file_size:.2f} KB, 最后修改时间: {modification_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 
-            last_csv_modification_time = os.path.getmtime(csv_file_path)
-            print(f"  创建了空CSV文件")
-    except Exception as e:
-        print(f"检查CSV文件时出错: {e}")
+                # 保存文件修改时间
+                last_csv_modification_time = os.path.getmtime(csv_file_path)
+                
+                # 尝试从CSV文件加载初始数据
+                print("  正在从CSV文件加载初始订单数据...")
+                initial_load = monitor_csv_file()
+                if initial_load:
+                    print(f"  成功从CSV文件加载初始订单数据，活跃订单: {len(active_orders)}个")
+                else:
+                    print("  未从CSV文件中找到符合条件的初始订单数据")
+            else:
+                print(f"  CSV文件不存在，将创建一个空文件用于后续监控")
+                with open(csv_file_path, 'w') as f:
+                    f.write("timestamp,analysis.交易币种,analysis.方向,analysis.入场点位1,analysis.止损点位1,analysis.止盈点位1\n")
+                    
+                last_csv_modification_time = os.path.getmtime(csv_file_path)
+                print(f"  创建了空CSV文件")
+        except Exception as e:
+            print(f"检查CSV文件时出错: {e}")
+    else:
+        print("警告：CSV文件路径未初始化")
     
     # 设置CSV检查时间
     last_csv_check_time = time.time()
@@ -1851,29 +2624,14 @@ if __name__ == '__main__':
     price_thread = socketio.start_background_task(background_monitoring)
     
     # 设置主机和端口
-    host = '0.0.0.0'  # 绑定到所有网络接口
-    port = 8080  # 使用8080端口，避免与其他服务冲突
+    host = '0.0.0.0'  # 绑定到所有网络接口，允许外部访问
+    port = 8080  # 使用8080端口
     
-    # 打印访问地址 - 使用多种方式获取IP
-    try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # 使用一个不需要实际连接的目标
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except:
-        # 备用方法
-        try:
-            hostname = socket.gethostname()
-            local_ip = socket.gethostbyname(hostname)
-        except:
-            local_ip = "无法获取IP地址，请检查网络"
-    
+    # 打印访问地址
     print("\n=================================================")
     print(f"应用已启动，可通过以下地址访问：")
     print(f"本地访问: http://localhost:{port}")
-    print(f"局域网访问: http://{local_ip}:{port}")
+    print(f"外部访问: http://47.239.197.28/")
     print("=================================================\n")
     
     # 只过滤订单数据，允许其他简单输出
@@ -1918,8 +2676,8 @@ if __name__ == '__main__':
             self.original.flush()
     
     # 替换标准输出
-    sys.stdout = SimpleFilteredStdout(original_stdout)
+    # sys.stdout = SimpleFilteredStdout(original_stdout)
     
-    # 启动Flask应用，允许其他主机访问
+    # 启动Flask应用，只允许本地访问
     print("准备启动Web服务器...")
-    socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True) 
+    socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
